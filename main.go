@@ -63,6 +63,25 @@ type StockResult struct {
 	Err  error
 }
 
+// HistoricalData represents a single day of stock data
+type HistoricalData struct {
+	Symbol   string    `json:"symbol"`
+	Date     time.Time `json:"date"`
+	Open     float64   `json:"open"`
+	High     float64   `json:"high"`
+	Low      float64   `json:"low"`
+	Close    float64   `json:"close"`
+	AdjClose float64   `json:"adjClose"`
+	Volume   int64     `json:"volume"`
+}
+
+// HistoricalResult represents the result of fetching historical data for a ticker
+type HistoricalResult struct {
+	Ticker string
+	Data   []HistoricalData
+	Err    error
+}
+
 // CredentialInfo stores the raw credential file information
 type CredentialInfo struct {
 	Web struct {
@@ -174,6 +193,76 @@ func initDB() (*sql.DB, error) {
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create indexes: %v", err)
+	}
+
+	// Create the stock_data table for S&P 500 tickers
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stock_data (
+			symbol TEXT PRIMARY KEY,
+			company_name TEXT,
+			price REAL,
+			change_amount REAL,
+			change_percent REAL,
+			volume INTEGER,
+			market_cap INTEGER,
+			previous_close REAL,
+			open_price REAL,
+			high REAL,
+			low REAL,
+			fifty_two_week_high REAL,
+			fifty_two_week_low REAL,
+			last_updated INTEGER,
+			UNIQUE(symbol)
+		)
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stock_data table: %v", err)
+	}
+
+	// Create the stock_historical_data table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stock_historical_data (
+			symbol TEXT,
+			date INTEGER,
+			open REAL,
+			high REAL,
+			low REAL,
+			close REAL,
+			adj_close REAL,
+			volume INTEGER,
+			PRIMARY KEY (symbol, date)
+		)
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stock_historical_data table: %v", err)
+	}
+
+	// Create indexes for emails
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_thread_id ON emails(thread_id);
+		CREATE INDEX IF NOT EXISTS idx_date ON emails(date);
+		CREATE INDEX IF NOT EXISTS idx_subject ON emails(subject);
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create indexes: %v", err)
+	}
+
+	// Create indexes for stock_data
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_stock_symbol ON stock_data(symbol);
+		CREATE INDEX IF NOT EXISTS idx_stock_updated ON stock_data(last_updated);
+		CREATE INDEX IF NOT EXISTS idx_stock_change_percent ON stock_data(change_percent);
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stock indexes: %v", err)
+	}
+
+	// Create indexes for stock_historical_data
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_historical_symbol_date ON stock_historical_data(symbol, date);
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create historical stock indexes: %v", err)
 	}
 
 	return db, nil
@@ -322,6 +411,9 @@ func main() {
 	http.HandleFunc("/sp500", func(w http.ResponseWriter, r *http.Request) {
 		sp500Handler(w, r, db)
 	})
+	http.HandleFunc("/historical-data", func(w http.ResponseWriter, r *http.Request) {
+		historicalDataHandler(w, r, db)
+	})
 
 	// Start the server
 	log.Printf("Server starting on :8080")
@@ -376,6 +468,11 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 				<h2>Stock Data</h2>
 				<a href="/sp500" class="button stock">Fetch S&P 500 Data</a>
 				<p><small>Fetches current stock data for all S&P 500 companies using concurrent goroutines.</small></p>
+			</div>
+			<div>
+				<h2>Historical Stock Data</h2>
+				<a href="/historical-data?table=sp500_list_2025_jun&start_date=2023-01-01&end_date=2023-12-31" class="button stock">Fetch Historical Data (Example)</a>
+				<p><small>Fetches historical stock data for a given table, start date, and end date.</small></p>
 			</div>
 		</body>
 	</html>
@@ -907,6 +1004,24 @@ func createTables(db *sql.DB) error {
 		return fmt.Errorf("failed to create stock_data table: %v", err)
 	}
 
+	// Create the stock_historical_data table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stock_historical_data (
+			symbol TEXT,
+			date INTEGER,
+			open REAL,
+			high REAL,
+			low REAL,
+			close REAL,
+			adj_close REAL,
+			volume INTEGER,
+			PRIMARY KEY (symbol, date)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create stock_historical_data table: %v", err)
+	}
+
 	// Create indexes for emails
 	_, err = db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_thread_id ON emails(thread_id);
@@ -927,540 +1042,63 @@ func createTables(db *sql.DB) error {
 		return fmt.Errorf("failed to create stock indexes: %v", err)
 	}
 
+	// Create indexes for stock_historical_data
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_historical_symbol_date ON stock_historical_data(symbol, date);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create historical stock indexes: %v", err)
+	}
+
 	return nil
 }
 
 func processEmail(message *gmail.Message) (*gmail.Message, error) {
-	// Extract message content
 	if err := extractMessageContent(message); err != nil {
 		return nil, fmt.Errorf("failed to extract content: %v", err)
 	}
 	return message, nil
 }
 
-// S&P 500 ticker list - this is a static list of the major S&P 500 companies
-// In production, you might want to fetch this dynamically from an API
-var sp500Tickers = []string{
-	"A",
-	"AAPL",
-	"ABBV",
-	"ABNB",
-	"ABT",
-	"ACGL",
-	"ACN",
-	"ADBE",
-	"ADI",
-	"ADM",
-	"ADP",
-	"ADSK",
-	"AEE",
-	"AEP",
-	"AES",
-	"AFL",
-	"AIG",
-	"AIZ",
-	"AJG",
-	"AKAM",
-	"ALB",
-	"ALGN",
-	"ALL",
-	"ALLE",
-	"AMAT",
-	"AMCR",
-	"AMD",
-	"AME",
-	"AMGN",
-	"AMP",
-	"AMT",
-	"AMZN",
-	"ANET",
-	"ANSS",
-	"AON",
-	"AOS",
-	"APA",
-	"APD",
-	"APH",
-	"APO",
-	"APTV",
-	"ARE",
-	"ATO",
-	"AVB",
-	"AVGO",
-	"AVY",
-	"AWK",
-	"AXON",
-	"AXP",
-	"AZO",
-	"BA",
-	"BAC",
-	"BALL",
-	"BAX",
-	"BBY",
-	"BDX",
-	"BEN",
-	"BF.B",
-	"BG",
-	"BIIB",
-	"BK",
-	"BKNG",
-	"BKR",
-	"BLDR",
-	"BLK",
-	"BMY",
-	"BR",
-	"BRK.B",
-	"BRO",
-	"BSX",
-	"BX",
-	"BXP",
-	"C",
-	"CAG",
-	"CAH",
-	"CARR",
-	"CAT",
-	"CB",
-	"CBOE",
-	"CBRE",
-	"CCI",
-	"CCL",
-	"CDNS",
-	"CDW",
-	"CEG",
-	"CF",
-	"CFG",
-	"CHD",
-	"CHRW",
-	"CHTR",
-	"CI",
-	"CINF",
-	"CL",
-	"CLX",
-	"CMCSA",
-	"CME",
-	"CMG",
-	"CMI",
-	"CMS",
-	"CNC",
-	"CNP",
-	"COF",
-	"COIN",
-	"COO",
-	"COP",
-	"COR",
-	"COST",
-	"CPAY",
-	"CPB",
-	"CPRT",
-	"CPT",
-	"CRL",
-	"CRM",
-	"CRWD",
-	"CSCO",
-	"CSGP",
-	"CSX",
-	"CTAS",
-	"CTRA",
-	"CTSH",
-	"CTVA",
-	"CVS",
-	"CVX",
-	"CZR",
-	"D",
-	"DAL",
-	"DASH",
-	"DAY",
-	"DD",
-	"DE",
-	"DECK",
-	"DELL",
-	"DG",
-	"DGX",
-	"DHI",
-	"DHR",
-	"DIS",
-	"DLR",
-	"DLTR",
-	"DOC",
-	"DOV",
-	"DOW",
-	"DPZ",
-	"DRI",
-	"DTE",
-	"DUK",
-	"DVA",
-	"DVN",
-	"DXCM",
-	"EA",
-	"EBAY",
-	"ECL",
-	"ED",
-	"EFX",
-	"EG",
-	"EIX",
-	"EL",
-	"ELV",
-	"EMN",
-	"EMR",
-	"ENPH",
-	"EOG",
-	"EPAM",
-	"EQIX",
-	"EQR",
-	"EQT",
-	"ERIE",
-	"ES",
-	"ESS",
-	"ETN",
-	"ETR",
-	"EVRG",
-	"EW",
-	"EXC",
-	"EXE",
-	"EXPD",
-	"EXPE",
-	"EXR",
-	"F",
-	"FANG",
-	"FAST",
-	"FCX",
-	"FDS",
-	"FDX",
-	"FE",
-	"FFIV",
-	"FI",
-	"FICO",
-	"FIS",
-	"FITB",
-	"FOX",
-	"FOXA",
-	"FRT",
-	"FSLR",
-	"FTNT",
-	"FTV",
-	"GD",
-	"GDDY",
-	"GE",
-	"GEHC",
-	"GEN",
-	"GEV",
-	"GILD",
-	"GIS",
-	"GL",
-	"GLW",
-	"GM",
-	"GNRC",
-	"GOOG",
-	"GOOGL",
-	"GPC",
-	"GPN",
-	"GRMN",
-	"GS",
-	"GWW",
-	"HAL",
-	"HAS",
-	"HBAN",
-	"HCA",
-	"HD",
-	"HES",
-	"HIG",
-	"HII",
-	"HLT",
-	"HOLX",
-	"HON",
-	"HPE",
-	"HPQ",
-	"HRL",
-	"HSIC",
-	"HST",
-	"HSY",
-	"HUBB",
-	"HUM",
-	"HWM",
-	"IBM",
-	"ICE",
-	"IDXX",
-	"IEX",
-	"IFF",
-	"INCY",
-	"INTC",
-	"INTU",
-	"INVH",
-	"IP",
-	"IPG",
-	"IQV",
-	"IR",
-	"IRM",
-	"ISRG",
-	"IT",
-	"ITW",
-	"IVZ",
-	"J",
-	"JBHT",
-	"JBL",
-	"JCI",
-	"JKHY",
-	"JNJ",
-	"JNPR",
-	"JPM",
-	"K",
-	"KDP",
-	"KEY",
-	"KEYS",
-	"KHC",
-	"KIM",
-	"KKR",
-	"KLAC",
-	"KMB",
-	"KMI",
-	"KMX",
-	"KO",
-	"KR",
-	"KVUE",
-	"L",
-	"LDOS",
-	"LEN",
-	"LH",
-	"LHX",
-	"LII",
-	"LIN",
-	"LKQ",
-	"LLY",
-	"LMT",
-	"LNT",
-	"LOW",
-	"LRCX",
-	"LULU",
-	"LUV",
-	"LVS",
-	"LW",
-	"LYB",
-	"LYV",
-	"MA",
-	"MAA",
-	"MAR",
-	"MAS",
-	"MCD",
-	"MCHP",
-	"MCK",
-	"MCO",
-	"MDLZ",
-	"MDT",
-	"MET",
-	"META",
-	"MGM",
-	"MHK",
-	"MKC",
-	"MKTX",
-	"MLM",
-	"MMC",
-	"MMM",
-	"MNST",
-	"MO",
-	"MOH",
-	"MOS",
-	"MPC",
-	"MPWR",
-	"MRK",
-	"MRNA",
-	"MS",
-	"MSCI",
-	"MSFT",
-	"MSI",
-	"MTB",
-	"MTCH",
-	"MTD",
-	"MU",
-	"NCLH",
-	"NDAQ",
-	"NDSN",
-	"NEE",
-	"NEM",
-	"NFLX",
-	"NI",
-	"NKE",
-	"NOC",
-	"NOW",
-	"NRG",
-	"NSC",
-	"NTAP",
-	"NTRS",
-	"NUE",
-	"NVDA",
-	"NVR",
-	"NWS",
-	"NWSA",
-	"NXPI",
-	"O",
-	"ODFL",
-	"OKE",
-	"OMC",
-	"ON",
-	"ORCL",
-	"ORLY",
-	"OTIS",
-	"OXY",
-	"PANW",
-	"PARA",
-	"PAYC",
-	"PAYX",
-	"PCAR",
-	"PCG",
-	"PEG",
-	"PEP",
-	"PFE",
-	"PFG",
-	"PG",
-	"PGR",
-	"PH",
-	"PHM",
-	"PKG",
-	"PLD",
-	"PLTR",
-	"PM",
-	"PNC",
-	"PNR",
-	"PNW",
-	"PODD",
-	"POOL",
-	"PPG",
-	"PPL",
-	"PRU",
-	"PSA",
-	"PSX",
-	"PTC",
-	"PWR",
-	"PYPL",
-	"QCOM",
-	"RCL",
-	"REG",
-	"REGN",
-	"RF",
-	"RJF",
-	"RL",
-	"RMD",
-	"ROK",
-	"ROL",
-	"ROP",
-	"ROST",
-	"RSG",
-	"RTX",
-	"RVTY",
-	"SBAC",
-	"SBUX",
-	"SCHW",
-	"SHW",
-	"SJM",
-	"SLB",
-	"SMCI",
-	"SNA",
-	"SNPS",
-	"SO",
-	"SOLV",
-	"SPG",
-	"SPGI",
-	"SRE",
-	"STE",
-	"STLD",
-	"STT",
-	"STX",
-	"STZ",
-	"SW",
-	"SWK",
-	"SWKS",
-	"SYF",
-	"SYK",
-	"SYY",
-	"T",
-	"TAP",
-	"TDG",
-	"TDY",
-	"TECH",
-	"TEL",
-	"TER",
-	"TFC",
-	"TGT",
-	"TJX",
-	"TKO",
-	"TMO",
-	"TMUS",
-	"TPL",
-	"TPR",
-	"TRGP",
-	"TRMB",
-	"TROW",
-	"TRV",
-	"TSCO",
-	"TSLA",
-	"TSN",
-	"TT",
-	"TTWO",
-	"TXN",
-	"TXT",
-	"TYL",
-	"UAL",
-	"UBER",
-	"UDR",
-	"UHS",
-	"ULTA",
-	"UNH",
-	"UNP",
-	"UPS",
-	"URI",
-	"USB",
-	"V",
-	"VICI",
-	"VLO",
-	"VLTO",
-	"VMC",
-	"VRSK",
-	"VRSN",
-	"VRTX",
-	"VST",
-	"VTR",
-	"VTRS",
-	"VZ",
-	"WAB",
-	"WAT",
-	"WBA",
-	"WBD",
-	"WDAY",
-	"WDC",
-	"WEC",
-	"WELL",
-	"WFC",
-	"WM",
-	"WMB",
-	"WMT",
-	"WRB",
-	"WSM",
-	"WST",
-	"WTW",
-	"WY",
-	"WYNN",
-	"XEL",
-	"XOM",
-	"XYL",
-	"YUM",
-	"ZBH",
-	"ZBRA",
-	"ZTS",
+// getActiveSP500Tickers fetches active ticker symbols from the database
+func (db *DB) getActiveSP500Tickers() ([]string, error) {
+	query := "SELECT ticker FROM sp500_list_2025_jun WHERE is_active = 1 ORDER BY ticker"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tickers: %v", err)
+	}
+	defer rows.Close()
+
+	var tickers []string
+	for rows.Next() {
+		var ticker string
+		if err := rows.Scan(&ticker); err != nil {
+			return nil, fmt.Errorf("failed to scan ticker: %v", err)
+		}
+		tickers = append(tickers, ticker)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %v", err)
+	}
+
+	return tickers, nil
 }
 
-// fetchStockData fetches stock data for a given ticker using a free API
 // fetchStockData fetches stock data for a given ticker using a free API
 func fetchStockData(ticker string) (*StockData, error) {
 	// Using Yahoo Finance API (free alternative)
 	url := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s", ticker)
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	
+
 	// Create request with User-Agent header (Yahoo Finance requires this)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %s: %v", ticker, err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch data for %s: %v", ticker, err)
@@ -1529,6 +1167,7 @@ func fetchStockData(ticker string) (*StockData, error) {
 		LastUpdated:      time.Now(),
 	}, nil
 }
+
 // saveStockData saves stock data to the database
 func (db *DB) saveStockData(stock *StockData) error {
 	stmt, err := db.Prepare(`
@@ -1568,9 +1207,19 @@ func (db *DB) saveStockData(stock *StockData) error {
 
 // fetchAllSP500Data fetches data for all S&P 500 tickers using goroutines
 func fetchAllSP500Data(db *DB) error {
+	// Get ticker list from database
+	tickers, err := db.getActiveSP500Tickers()
+	if err != nil {
+		return fmt.Errorf("failed to get ticker list: %v", err)
+	}
+
+	if len(tickers) == 0 {
+		return fmt.Errorf("no active tickers found in database")
+	}
+
 	numWorkers := 20 // Concurrent goroutines
-	jobs := make(chan string, len(sp500Tickers))
-	results := make(chan StockResult, len(sp500Tickers))
+	jobs := make(chan string, len(tickers))
+	results := make(chan StockResult, len(tickers))
 
 	// Start worker pool
 	var wg sync.WaitGroup
@@ -1597,7 +1246,7 @@ func fetchAllSP500Data(db *DB) error {
 	}
 
 	// Send jobs to workers
-	for _, ticker := range sp500Tickers {
+	for _, ticker := range tickers {
 		jobs <- ticker
 	}
 	close(jobs)
@@ -1619,7 +1268,7 @@ func fetchAllSP500Data(db *DB) error {
 		}
 	}
 
-	log.Printf("Successfully fetched and saved data for %d out of %d S&P 500 tickers", successCount, len(sp500Tickers))
+	log.Printf("Successfully fetched and saved data for %d out of %d S&P 500 tickers", successCount, len(tickers))
 
 	if len(errors) > 0 {
 		log.Printf("Encountered %d errors while fetching stock data", len(errors))
@@ -1656,4 +1305,280 @@ func sp500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 		Success: true,
 		Message: message,
 	})
+}
+
+// historicalDataHandler handles the historical data fetching endpoint
+func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
+	// 1. Parse query parameters
+	tableName := r.URL.Query().Get("table")
+	startDateStr := r.URL.Query().Get("start_date")
+	endDateStr := r.URL.Query().Get("end_date")
+
+	if tableName == "" || startDateStr == "" || endDateStr == "" {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Error:   "Missing required query parameters: table, start_date, end_date",
+		})
+		return
+	}
+
+	// 2. Parse dates
+	layout := "2006-01-02"
+	startDate, err := time.Parse(layout, startDateStr)
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid start_date format: %v", err),
+		})
+		return
+	}
+	endDate, err := time.Parse(layout, endDateStr)
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid end_date format: %v", err),
+		})
+		return
+	}
+
+	log.Printf("Starting historical data fetch for table '%s' from %s to %s...", tableName, startDateStr, endDateStr)
+	start := time.Now()
+
+	// 3. Fetch historical data
+	if err := fetchAllHistoricalData(db, tableName, startDate, endDate); err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Failed to fetch historical data: %v", err),
+		})
+		return
+	}
+
+	duration := time.Since(start)
+	message := fmt.Sprintf("Successfully fetched historical data in %v", duration)
+	log.Printf(message)
+
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: message,
+	})
+}
+
+// getTickersFromTable fetches ticker symbols from a specified table
+func (db *DB) getTickersFromTable(tableName string) ([]string, error) {
+	// Sanitize table name to prevent SQL injection
+	// A simple approach is to allow only alphanumeric characters and underscores
+	if matched, _ := regexp.MatchString(`^[a-zA-Z0-9_]+$`, tableName); !matched {
+		return nil, fmt.Errorf("invalid table name: %s", tableName)
+	}
+
+	query := fmt.Sprintf("SELECT ticker FROM %s WHERE is_active = 1 ORDER BY ticker", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tickers from %s: %v", tableName, err)
+	}
+	defer rows.Close()
+
+	var tickers []string
+	for rows.Next() {
+		var ticker string
+		if err := rows.Scan(&ticker); err != nil {
+			return nil, fmt.Errorf("failed to scan ticker: %v", err)
+		}
+		tickers = append(tickers, ticker)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("row iteration error: %v", err)
+	}
+
+	return tickers, nil
+}
+
+// fetchAllHistoricalData fetches historical data for all tickers from a given table
+func fetchAllHistoricalData(db *DB, tableName string, startDate, endDate time.Time) error {
+	tickers, err := db.getTickersFromTable(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get ticker list: %v", err)
+	}
+
+	if len(tickers) == 0 {
+		return fmt.Errorf("no active tickers found in table %s", tableName)
+	}
+
+	numWorkers := 20
+	jobs := make(chan string, len(tickers))
+	results := make(chan HistoricalResult, len(tickers))
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ticker := range jobs {
+				historicalData, err := fetchHistoricalTickerData(ticker, startDate, endDate)
+				if err != nil {
+					results <- HistoricalResult{Ticker: ticker, Err: err}
+					continue
+				}
+
+				if err := db.saveHistoricalData(historicalData); err != nil {
+					results <- HistoricalResult{Ticker: ticker, Err: err}
+					continue
+				}
+
+				results <- HistoricalResult{Ticker: ticker, Data: historicalData}
+			}
+		}()
+	}
+
+	for _, ticker := range tickers {
+		jobs <- ticker
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var errors []error
+	var successCount int
+	for result := range results {
+		if result.Err != nil {
+			errors = append(errors, result.Err)
+		} else {
+			successCount++
+		}
+	}
+
+	log.Printf("Successfully fetched and saved historical data for %d out of %d tickers", successCount, len(tickers))
+
+	if len(errors) > 0 {
+		log.Printf("Encountered %d errors while fetching historical data", len(errors))
+		for i, err := range errors {
+			if i >= 5 {
+				break
+			}
+			log.Printf("Error %d: %v", i+1, err)
+		}
+	}
+
+	return nil
+}
+
+// fetchHistoricalTickerData fetches historical data for a single ticker from Yahoo Finance
+func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]HistoricalData, error) {
+	// Yahoo Finance uses Unix timestamps for period1 and period2
+	p1 := startDate.Unix()
+	p2 := endDate.Unix()
+
+	url := fmt.Sprintf("https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%d&period2=%d&interval=1d&events=history&includeAdjustedClose=true", ticker, p1, p2)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for %s: %v", ticker, err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch data for %s: %v", ticker, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed for %s: status %d", ticker, resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response for %s: %v", ticker, err)
+	}
+
+	// Parse CSV response
+	lines := strings.Split(string(body), "\n")
+	if len(lines) < 2 {
+		return nil, fmt.Errorf("no data returned for %s", ticker)
+	}
+
+	var historicalData []HistoricalData
+	// Skip header line
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+
+		records := strings.Split(line, ",")
+		if len(records) != 7 {
+			continue // Skip malformed lines
+		}
+
+		date, err := time.Parse("2006-01-02", records[0])
+		if err != nil {
+			continue
+		}
+
+		open, _ := strconv.ParseFloat(records[1], 64)
+		high, _ := strconv.ParseFloat(records[2], 64)
+		low, _ := strconv.ParseFloat(records[3], 64)
+		closePrice, _ := strconv.ParseFloat(records[4], 64)
+		adjClose, _ := strconv.ParseFloat(records[5], 64)
+		volume, _ := strconv.ParseInt(records[6], 10, 64)
+
+		historicalData = append(historicalData, HistoricalData{
+			Symbol:   ticker,
+			Date:     date,
+			Open:     open,
+			High:     high,
+			Low:      low,
+			Close:    closePrice,
+			AdjClose: adjClose,
+			Volume:   volume,
+		})
+	}
+
+	return historicalData, nil
+}
+
+// saveHistoricalData saves a slice of historical data points to the database
+func (db *DB) saveHistoricalData(data []HistoricalData) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO stock_historical_data (
+			symbol, date, open, high, low, close, adj_close, volume
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+
+	for _, d := range data {
+		_, err := stmt.Exec(
+			d.Symbol,
+			d.Date.Unix(),
+			d.Open,
+			d.High,
+			d.Low,
+			d.Close,
+			d.AdjClose,
+			d.Volume,
+		)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to insert historical data for %s on %s: %v", d.Symbol, d.Date.String(), err)
+		}
+	}
+
+	return tx.Commit()
 }
