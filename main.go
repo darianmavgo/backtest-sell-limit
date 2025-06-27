@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -1313,6 +1314,7 @@ func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
 	tableName := r.URL.Query().Get("table")
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
+	symbol := r.URL.Query().Get("symbol")
 
 	if tableName == "" || startDateStr == "" || endDateStr == "" {
 		sendJSONResponse(w, HandlerResponse{
@@ -1345,10 +1347,28 @@ func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
 	start := time.Now()
 
 	// 3. Fetch historical data
-	if err := fetchAllHistoricalData(db, tableName, startDate, endDate); err != nil {
+	var fetchErr error
+	if symbol != "" {
+		// Fetch data for a single symbol
+		log.Printf("Fetching historical data for single symbol: %s", symbol)
+		data, err := fetchHistoricalTickerData(symbol, startDate, endDate)
+		if err != nil {
+			sendJSONResponse(w, HandlerResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to fetch historical data for %s: %v", symbol, err),
+			})
+			return
+		}
+		fetchErr = db.saveHistoricalData(data)
+	} else {
+		// Fetch data for all symbols in the table
+		fetchErr = fetchAllHistoricalData(db, tableName, startDate, endDate)
+	}
+
+	if fetchErr != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to fetch historical data: %v", err),
+			Error:   fmt.Sprintf("Failed to fetch historical data: %v", fetchErr),
 		})
 		return
 	}
@@ -1396,11 +1416,14 @@ func (db *DB) getTickersFromTable(tableName string) ([]string, error) {
 
 // fetchAllHistoricalData fetches historical data for all tickers from a given table
 func fetchAllHistoricalData(db *DB, tableName string, startDate, endDate time.Time) error {
+	log.Printf("Starting historical data fetch for table %s from %s to %s", tableName, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+
 	tickers, err := db.getTickersFromTable(tableName)
 	if err != nil {
 		return fmt.Errorf("failed to get ticker list: %v", err)
 	}
 
+	log.Printf("Found %d tickers in table %s", len(tickers), tableName)
 	if len(tickers) == 0 {
 		return fmt.Errorf("no active tickers found in table %s", tableName)
 	}
@@ -1415,13 +1438,17 @@ func fetchAllHistoricalData(db *DB, tableName string, startDate, endDate time.Ti
 		go func() {
 			defer wg.Done()
 			for ticker := range jobs {
+				log.Printf("Fetching historical data for %s", ticker)
 				historicalData, err := fetchHistoricalTickerData(ticker, startDate, endDate)
 				if err != nil {
+					log.Printf("Error fetching historical data for %s: %v", ticker, err)
 					results <- HistoricalResult{Ticker: ticker, Err: err}
 					continue
 				}
 
+				log.Printf("Saving %d data points for %s", len(historicalData), ticker)
 				if err := db.saveHistoricalData(historicalData); err != nil {
+					log.Printf("Error saving historical data for %s: %v", ticker, err)
 					results <- HistoricalResult{Ticker: ticker, Err: err}
 					continue
 				}
@@ -1472,14 +1499,21 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 	p1 := startDate.Unix()
 	p2 := endDate.Unix()
 
-	url := fmt.Sprintf("https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%d&period2=%d&interval=1d&events=history&includeAdjustedClose=true", ticker, p1, p2)
+	url := fmt.Sprintf("https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includeAdjustedClose=true", ticker, p1, p2)
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request for %s: %v", ticker, err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	// Add required headers
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Origin", "https://finance.yahoo.com")
+	req.Header.Set("Referer", fmt.Sprintf("https://finance.yahoo.com/quote/%s", ticker))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1491,50 +1525,91 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 		return nil, fmt.Errorf("API request failed for %s: status %d", ticker, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Handle gzip compression
+	var reader io.Reader
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader for %s: %v", ticker, err)
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	default:
+		reader = resp.Body
+	}
+
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response for %s: %v", ticker, err)
 	}
 
-	// Parse CSV response
-	lines := strings.Split(string(body), "\n")
-	if len(lines) < 2 {
+	// Parse JSON response
+	var response struct {
+		Chart struct {
+			Result []struct {
+				Meta struct {
+					Symbol string `json:"symbol"`
+				} `json:"meta"`
+				Timestamp  []int64 `json:"timestamp"`
+				Indicators struct {
+					Quote []struct {
+						Open   []float64 `json:"open"`
+						High   []float64 `json:"high"`
+						Low    []float64 `json:"low"`
+						Close  []float64 `json:"close"`
+						Volume []int64   `json:"volume"`
+					} `json:"quote"`
+					Adjclose []struct {
+						Adjclose []float64 `json:"adjclose"`
+					} `json:"adjclose"`
+				} `json:"indicators"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"chart"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON for %s: %v", ticker, err)
+	}
+
+	if response.Chart.Error != nil {
+		return nil, fmt.Errorf("API error for %s: %v", ticker, response.Chart.Error)
+	}
+
+	if len(response.Chart.Result) == 0 {
 		return nil, fmt.Errorf("no data returned for %s", ticker)
 	}
 
+	result := response.Chart.Result[0]
+	if len(result.Timestamp) == 0 {
+		return nil, fmt.Errorf("no timestamps returned for %s", ticker)
+	}
+
+	if len(result.Indicators.Quote) == 0 || len(result.Indicators.Adjclose) == 0 {
+		return nil, fmt.Errorf("no price data returned for %s", ticker)
+	}
+
+	quote := result.Indicators.Quote[0]
+	adjclose := result.Indicators.Adjclose[0]
+
 	var historicalData []HistoricalData
-	// Skip header line
-	for _, line := range lines[1:] {
-		if line == "" {
+	for i, ts := range result.Timestamp {
+		if i >= len(quote.Open) || i >= len(quote.High) || i >= len(quote.Low) ||
+			i >= len(quote.Close) || i >= len(quote.Volume) || i >= len(adjclose.Adjclose) {
 			continue
 		}
 
-		records := strings.Split(line, ",")
-		if len(records) != 7 {
-			continue // Skip malformed lines
-		}
-
-		date, err := time.Parse("2006-01-02", records[0])
-		if err != nil {
-			continue
-		}
-
-		open, _ := strconv.ParseFloat(records[1], 64)
-		high, _ := strconv.ParseFloat(records[2], 64)
-		low, _ := strconv.ParseFloat(records[3], 64)
-		closePrice, _ := strconv.ParseFloat(records[4], 64)
-		adjClose, _ := strconv.ParseFloat(records[5], 64)
-		volume, _ := strconv.ParseInt(records[6], 10, 64)
-
+		date := time.Unix(ts, 0)
 		historicalData = append(historicalData, HistoricalData{
 			Symbol:   ticker,
 			Date:     date,
-			Open:     open,
-			High:     high,
-			Low:      low,
-			Close:    closePrice,
-			AdjClose: adjClose,
-			Volume:   volume,
+			Open:     quote.Open[i],
+			High:     quote.High[i],
+			Low:      quote.Low[i],
+			Close:    quote.Close[i],
+			AdjClose: adjclose.Adjclose[i],
+			Volume:   quote.Volume[i],
 		})
 	}
 
@@ -1576,9 +1651,15 @@ func (db *DB) saveHistoricalData(data []HistoricalData) error {
 		)
 		if err != nil {
 			tx.Rollback()
+			log.Printf("Error inserting data for %s on %s: %v", d.Symbol, d.Date.Format("2006-01-02"), err)
 			return fmt.Errorf("failed to insert historical data for %s on %s: %v", d.Symbol, d.Date.String(), err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	return nil
 }

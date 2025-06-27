@@ -45,57 +45,59 @@ class PortfolioStrategy(bt.Strategy):
         portfolio_value = self.broker.getvalue()
         logger.info(f'Date: {self.data0.datetime.date()} Portfolio Value: ${portfolio_value:.2f}')
 
-def get_portfolio_symbols():
-    """Get list of symbols from SQLite database"""
-    conn = sqlite3.connect('backtest_sell_limits.db')
-    try:
-        query = "SELECT symbol FROM portfolio WHERE shares > 0"
-        df = pd.read_sql_query(query, conn)
-        return df['symbol'].tolist()
-    finally:
-        conn.close()
-
-def get_historical_data(symbol, start_date, end_date):
-    """Get historical data for a symbol from SQLite database"""
+def get_portfolio_data():
+    """Get portfolio data with current prices from SQLite database"""
     conn = sqlite3.connect('backtest_sell_limits.db')
     try:
         query = """
         SELECT 
-            date,
-            open,
-            high,
-            low,
-            close,
-            adj_close as adj_close,
-            volume
-        FROM stock_historical_data
-        WHERE symbol = ?
-        AND date >= ?
-        AND date <= ?
-        ORDER BY date
+            p.symbol,
+            p.shares,
+            p.purchase_price,
+            p.purchase_date,
+            s.price as current_price,
+            s.open_price as open,
+            s.high,
+            s.low,
+            s.price as close,
+            s.volume,
+            s.last_updated
+        FROM portfolio p
+        JOIN stock_data s ON p.symbol = s.symbol
+        WHERE p.shares > 0
         """
-        
-        # Convert dates to Unix timestamps for SQLite
-        start_timestamp = int(start_date.timestamp())
-        end_timestamp = int(end_date.timestamp())
-        
-        # Read data from SQLite
-        df = pd.read_sql_query(
-            query, 
-            conn, 
-            params=[symbol, start_timestamp, end_timestamp]
-        )
-        
-        # Convert Unix timestamp to datetime
-        df['date'] = pd.to_datetime(df['date'], unit='s')
-        
-        if not df.empty:
-            # Set date as index
-            df.set_index('date', inplace=True)
-            return df
-        return None
+        df = pd.read_sql_query(query, conn)
+        return df
     finally:
         conn.close()
+
+def calculate_portfolio_value():
+    """Calculate current portfolio value"""
+    df = get_portfolio_data()
+    
+    # Calculate total value
+    total_value = (df['shares'] * df['current_price']).sum()
+    total_cost = (df['shares'] * df['purchase_price']).sum()
+    total_return = ((total_value - total_cost) / total_cost) * 100
+    
+    logger.info("\n=== Portfolio Summary ===")
+    logger.info(f"Number of Stocks: {len(df)}")
+    logger.info(f"Total Cost: ${total_cost:,.2f}")
+    logger.info(f"Current Value: ${total_value:,.2f}")
+    logger.info(f"Total Return: {total_return:.2f}%")
+    
+    # Show top 5 gainers and losers
+    df['return'] = ((df['current_price'] - df['purchase_price']) / df['purchase_price']) * 100
+    
+    logger.info("\nTop 5 Gainers:")
+    top_gainers = df.nlargest(5, 'return')
+    for _, row in top_gainers.iterrows():
+        logger.info(f"{row['symbol']}: {row['return']:.2f}%")
+    
+    logger.info("\nTop 5 Losers:")
+    top_losers = df.nsmallest(5, 'return')
+    for _, row in top_losers.iterrows():
+        logger.info(f"{row['symbol']}: {row['return']:.2f}%")
 
 def run_portfolio_backtest(tickers):
     """
@@ -170,7 +172,7 @@ def run_backtest():
     cerebro.broker.setcash(initial_cash)
     
     # Get portfolio symbols
-    symbols = get_portfolio_symbols()
+    symbols = get_sp500_tickers()
     logger.info(f"Found {len(symbols)} symbols in portfolio")
     
     # Set date range for last 12 months
@@ -226,6 +228,8 @@ def run_backtest():
     cerebro.plot()
 
 if __name__ == '__main__':
+    calculate_portfolio_value()
+
     sp500_tickers = get_sp500_tickers()
     if sp500_tickers:
         run_portfolio_backtest(sp500_tickers)
