@@ -70,8 +70,21 @@ class PortfolioStrategy(bt.Strategy):
     def __init__(self):
         self.orders = {}  # Keep track of orders
         self.initial_cash = self.broker.getvalue()
+        self.stocks_bought = False
         
     def next(self):
+        # Buy stocks on the first day
+        if not self.stocks_bought:
+            for data in self.datas:
+                # Calculate the number of shares we can buy
+                size = 1  # Buy 1 share of each stock
+                
+                # Create a buy order
+                self.orders[data._name] = self.buy(data=data, size=size)
+                logger.info(f'Buying {size} shares of {data._name} at {data.close[0]}')
+            
+            self.stocks_bought = True
+        
         # Log daily portfolio value
         portfolio_value = self.broker.getvalue()
         logger.info(f'Date: {self.data0.datetime.date()} Portfolio Value: ${portfolio_value:.2f}')
