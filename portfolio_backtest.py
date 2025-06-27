@@ -3,11 +3,9 @@ import backtrader as bt
 import pandas as pd
 from datetime import datetime, timedelta
 import warnings
-import yfinance as yf
 import logging
 
-# Suppress DeprecationWarning from yfinance which is noisy
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -15,15 +13,15 @@ logger = logging.getLogger(__name__)
 
 DB_FILE = "backtest_sell_limits.db"
 TICKER_TABLE = "sp500_list_2025_jun"
-START_DATE = "2024-06-01"
+START_DATE = "2024-05-01"
+END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0 # A large amount to ensure any trade can be made
 
 def get_sp500_tickers():
     """Fetches the list of S&P 500 tickers from the SQLite database."""
     try:
         con = sqlite3.connect(DB_FILE)
-        # Tickers in the db can have a "." (e.g., BRK.B), yfinance needs a "-" (BRK-B)
-        query = f"SELECT REPLACE(ticker, '.', '-') as ticker FROM {TICKER_TABLE} WHERE is_active = 1"
+        query = f"SELECT ticker FROM {TICKER_TABLE} WHERE is_active = 1"
         df = pd.read_sql_query(query, con)
         return df['ticker'].tolist()
     except Exception as e:
@@ -32,6 +30,39 @@ def get_sp500_tickers():
     finally:
         if 'con' in locals() and con:
             con.close()
+
+def get_historical_data(symbol, start_date, end_date):
+    """Get historical data for a symbol from SQLite database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        query = """
+        SELECT 
+            datetime(date, 'unixepoch') as date,
+            open,
+            high,
+            low,
+            close,
+            adj_close,
+            volume
+        FROM stock_historical_data
+        WHERE symbol = ?
+        AND date >= strftime('%s', ?)
+        AND date <= strftime('%s', ?)
+        ORDER BY date
+        """
+        df = pd.read_sql_query(
+            query, 
+            conn, 
+            params=[symbol, start_date, end_date],
+            parse_dates={'date': '%Y-%m-%d %H:%M:%S'}
+        )
+        df.set_index('date', inplace=True)
+        return df
+    except Exception as e:
+        logger.error(f"Error fetching historical data for {symbol}: {e}")
+        return None
+    finally:
+        conn.close()
 
 class PortfolioStrategy(bt.Strategy):
     """A simple buy and hold strategy for the portfolio"""
@@ -99,141 +130,57 @@ def calculate_portfolio_value():
     for _, row in top_losers.iterrows():
         logger.info(f"{row['symbol']}: {row['return']:.2f}%")
 
-def run_portfolio_backtest(tickers):
-    """
-    Runs a 'buy and hold one share' backtest for a list of tickers
-    and aggregates the results using backtrader's native Yahoo feed.
-    """
-    total_initial_investment = 0
-    total_final_value = 0
-    failed_tickers = []
-    
-    print(f"Starting backtest for {len(tickers)} tickers using backtrader's Yahoo feed...")
-
-    for i, ticker in enumerate(tickers):
-        print(f"Processing ({i+1}/{len(tickers)}): {ticker}")
-        try:
-            cerebro = bt.Cerebro(stdstats=False)
-            cerebro.broker.set_cash(INITIAL_CASH)
-
-            # Create a data feed
-            from_date = datetime.strptime(START_DATE, "%Y-%m-%d")
-            data_feed = bt.feeds.YahooFinanceData(dataname=ticker, fromdate=from_date)
-            cerebro.adddata(data_feed)
-            
-            # Add the strategy
-            cerebro.addstrategy(PortfolioStrategy)
-            
-            # Run the backtest
-            results = cerebro.run()
-            strategy_instance = results[0]
-
-            # Get the results from the strategy and broker
-            initial_investment_this_stock = strategy_instance.initial_cash - INITIAL_CASH
-            
-            # Final portfolio value for this stock is its end value, calculated
-            # from the total value minus the unused cash.
-            final_value_this_stock = cerebro.broker.getvalue() - (INITIAL_CASH - initial_investment_this_stock)
-
-            if initial_investment_this_stock > 0:
-                total_initial_investment += initial_investment_this_stock
-                total_final_value += final_value_this_stock
-                print(f"  - {ticker}: Invested ${initial_investment_this_stock:.2f}, Final Value: ${final_value_this_stock:.2f}")
-            else:
-                print(f"  - WARNING: No purchase was made for {ticker}. Final value: {cerebro.broker.getvalue()}. Skipping.")
-                failed_tickers.append(ticker)
-
-
-        except Exception as e:
-            print(f"  - ERROR processing {ticker}: {e}")
-            failed_tickers.append(ticker)
-
-    print("\n--- Backtest Complete ---")
-    if total_initial_investment > 0:
-        portfolio_return = ((total_final_value - total_initial_investment) / total_initial_investment) * 100
-        print(f"Start Date:                  {START_DATE}")
-        print(f"End Date:                    {datetime.now().strftime('%Y-%m-%d')}")
-        print(f"Total Initial Investment:    ${total_initial_investment:,.2f}")
-        print(f"Total Final Portfolio Value: ${total_final_value:,.2f}")
-        print(f"Total Profit / Loss:         ${(total_final_value - total_initial_investment):,.2f}")
-        print(f"Portfolio Return:            {portfolio_return:.2f}%")
-    else:
-        print("Could not calculate portfolio performance.")
-
-    if failed_tickers:
-        print(f"\nFailed to process {len(failed_tickers)} tickers: {', '.join(failed_tickers)}")
-
 def run_backtest():
+    """Run backtest using historical data from SQLite database"""
     # Create a cerebro entity
     cerebro = bt.Cerebro()
     
     # Set initial cash
-    initial_cash = 1000000.0  # $1M initial capital
-    cerebro.broker.setcash(initial_cash)
+    cerebro.broker.setcash(INITIAL_CASH)
     
     # Get portfolio symbols
     symbols = get_sp500_tickers()
     logger.info(f"Found {len(symbols)} symbols in portfolio")
     
-    # Set date range for last 12 months
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365)
-    
     # Add data feeds for each symbol
     for symbol in symbols:
-        logger.info(f"Fetching data for {symbol}...")
-        df = get_historical_data(symbol, start_date, end_date)
+        logger.info(f"Fetching historical data for {symbol}...")
+        df = get_historical_data(symbol, START_DATE, END_DATE)
         if df is not None and not df.empty:
             # Create data feed
             data = bt.feeds.PandasData(
                 dataname=df,
-                datetime=None,  # Use index as datetime
-                open=0,  # Column index for 'open'
-                high=1,  # Column index for 'high'
-                low=2,   # Column index for 'low'
-                close=3, # Column index for 'close'
-                volume=6,  # Column index for 'volume'
-                openinterest=-1  # Not available
+                fromdate=datetime.strptime(START_DATE, '%Y-%m-%d'),
+                todate=datetime.strptime(END_DATE, '%Y-%m-%d')
             )
             cerebro.adddata(data, name=symbol)
             logger.info(f"Added data feed for {symbol}")
         else:
             logger.warning(f"No data available for {symbol}")
     
-    # Add strategy
+    # Add the strategy
     cerebro.addstrategy(PortfolioStrategy)
     
-    # Add analyzers
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-    
-    # Run backtest
-    logger.info("Starting backtest...")
+    # Run the backtest
+    logger.info("\nStarting Portfolio Backtest...")
+    initial_value = cerebro.broker.getvalue()
     results = cerebro.run()
-    strat = results[0]
-    
-    # Print results
     final_value = cerebro.broker.getvalue()
-    returns = (final_value - initial_cash) / initial_cash * 100
     
-    logger.info("=== Backtest Results ===")
-    logger.info(f"Initial Portfolio Value: ${initial_cash:,.2f}")
+    # Calculate and display results
+    total_return = ((final_value - initial_value) / initial_value) * 100
+    logger.info("\n=== Backtest Results ===")
+    logger.info(f"Start Date: {START_DATE}")
+    logger.info(f"End Date: {END_DATE}")
+    logger.info(f"Initial Portfolio Value: ${initial_value:,.2f}")
     logger.info(f"Final Portfolio Value: ${final_value:,.2f}")
-    logger.info(f"Return: {returns:.2f}%")
-    logger.info(f"Sharpe Ratio: {strat.analyzers.sharpe.get_analysis()['sharperatio']:.2f}")
-    logger.info(f"Max Drawdown: {strat.analyzers.drawdown.get_analysis()['max']['drawdown']:.2f}%")
-    
-    # Plot results
-    cerebro.plot()
+    logger.info(f"Total Return: {total_return:.2f}%")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     calculate_portfolio_value()
 
     sp500_tickers = get_sp500_tickers()
     if sp500_tickers:
-        run_portfolio_backtest(sp500_tickers)
+        run_backtest()
     else:
-        print("No tickers found. Exiting.")
-
-    run_backtest() 
+        print("No tickers found. Exiting.") 
