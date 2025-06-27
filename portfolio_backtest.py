@@ -64,6 +64,57 @@ def get_historical_data(symbol, start_date, end_date):
     finally:
         conn.close()
 
+def save_backtest_results(strategy_name, daily_values, initial_value, final_value, total_return):
+    """Save backtest results to SQLite database"""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        # Create tables if they don't exist
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_strategies (
+            strategy_name TEXT PRIMARY KEY,
+            start_date TEXT,
+            end_date TEXT,
+            initial_value REAL,
+            final_value REAL,
+            total_return REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_daily_values (
+            strategy_name TEXT,
+            date TEXT,
+            portfolio_value REAL,
+            PRIMARY KEY (strategy_name, date),
+            FOREIGN KEY (strategy_name) REFERENCES backtest_strategies(strategy_name)
+        )
+        """)
+        
+        # Save strategy summary
+        conn.execute("""
+        INSERT OR REPLACE INTO backtest_strategies 
+        (strategy_name, start_date, end_date, initial_value, final_value, total_return)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (strategy_name, START_DATE, END_DATE, initial_value, final_value, total_return))
+        
+        # Save daily values
+        for date, value in daily_values:
+            conn.execute("""
+            INSERT OR REPLACE INTO backtest_daily_values 
+            (strategy_name, date, portfolio_value)
+            VALUES (?, ?, ?)
+            """, (strategy_name, date.strftime('%Y-%m-%d'), value))
+        
+        conn.commit()
+        logger.info(f"Saved backtest results for strategy: {strategy_name}")
+        
+    except Exception as e:
+        logger.error(f"Error saving backtest results: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
 class PortfolioStrategy(bt.Strategy):
     """A simple buy and hold strategy for the portfolio"""
     
@@ -71,6 +122,7 @@ class PortfolioStrategy(bt.Strategy):
         self.orders = {}  # Keep track of orders
         self.initial_cash = self.broker.getvalue()
         self.stocks_bought = False
+        self.daily_values = []
         
     def next(self):
         # Buy stocks on the first day
@@ -84,6 +136,9 @@ class PortfolioStrategy(bt.Strategy):
                 logger.info(f'Buying {size} shares of {data._name} at {data.close[0]}')
             
             self.stocks_bought = True
+        
+        # Store daily portfolio value
+        self.daily_values.append((self.data0.datetime.date(), self.broker.getvalue()))
         
         # Log daily portfolio value
         portfolio_value = self.broker.getvalue()
@@ -180,6 +235,9 @@ def run_backtest():
     results = cerebro.run()
     final_value = cerebro.broker.getvalue()
     
+    # Get the strategy instance
+    strategy = results[0]
+    
     # Calculate and display results
     total_return = ((final_value - initial_value) / initial_value) * 100
     logger.info("\n=== Backtest Results ===")
@@ -188,6 +246,15 @@ def run_backtest():
     logger.info(f"Initial Portfolio Value: ${initial_value:,.2f}")
     logger.info(f"Final Portfolio Value: ${final_value:,.2f}")
     logger.info(f"Total Return: {total_return:.2f}%")
+    
+    # Save results to database
+    save_backtest_results(
+        "buy and hold",
+        strategy.daily_values,
+        initial_value,
+        final_value,
+        total_return
+    )
 
 if __name__ == "__main__":
     calculate_portfolio_value()
