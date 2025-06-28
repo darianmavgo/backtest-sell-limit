@@ -9,7 +9,8 @@ import os
 
 def load_sql_query(filename):
     """Load SQL query from file in sql/ directory"""
-    sql_path = os.path.join("sql", filename)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sql_path = os.path.join(script_dir, "sql", filename)
     with open(sql_path, 'r') as f:
         return f.read().strip()
 
@@ -119,36 +120,86 @@ class DatabaseLogHandler(logging.Handler):
         super().__init__()
         self.db_file = db_file
         self.timeout = timeout
+        
+        # Ensure the directory exists
+        db_dir = os.path.dirname(self.db_file)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            
         self.create_table()
 
     def create_table(self):
         """Create the logs table if it doesn't exist."""
-        with sqlite3.connect(self.db_file, timeout=self.timeout) as conn:
-            conn.execute(load_sql_query("create_logs_table.sql"))
-            conn.commit()
+        try:
+            with sqlite3.connect(self.db_file, timeout=self.timeout) as conn:
+                conn.execute(load_sql_query("create_logs_table.sql"))
+                conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"DatabaseLogHandler: Error creating table: {e}", file=sys.stderr)
+            print(f"Database file: {self.db_file}", file=sys.stderr)
+            # Try to create a backup database file
+            backup_db = self.db_file + ".backup"
+            try:
+                with sqlite3.connect(backup_db, timeout=self.timeout) as conn:
+                    conn.execute(load_sql_query("create_logs_table.sql"))
+                    conn.commit()
+                    self.db_file = backup_db
+                    print(f"Created backup database: {backup_db}", file=sys.stderr)
+            except Exception as backup_error:
+                print(f"Failed to create backup database: {backup_error}", file=sys.stderr)
 
     def emit(self, record):
         """Emit a log record."""
-        try:
-            with sqlite3.connect(self.db_file, timeout=self.timeout) as conn:
-                message = self.format(record)
-                conn.execute(load_sql_query("insert_log_entry.sql"), (
-                    datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f'),
-                    record.name,
-                    record.levelname,
-                    message,
-                    getattr(record, 'symbol', None),
-                    getattr(record, 'order_type', None),
-                    getattr(record, 'status', None),
-                    getattr(record, 'price', None),
-                    getattr(record, 'size', None),
-                    getattr(record, 'order_ref', None),
-                    getattr(record, 'parent_ref', None)
-                ))
-                conn.commit()
-        except Exception:
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+        max_retries = 3
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                # Use absolute path and add additional connection parameters for reliability
+                conn = sqlite3.connect(
+                    self.db_file, 
+                    timeout=self.timeout,
+                    check_same_thread=False,
+                    isolation_level=None  # Autocommit mode
+                )
+                try:
+                    message = self.format(record)
+                    conn.execute(load_sql_query("insert_log_entry.sql"), (
+                        datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f'),
+                        record.name,
+                        record.levelname,
+                        message,
+                        getattr(record, 'symbol', None),
+                        getattr(record, 'order_type', None),
+                        getattr(record, 'status', None),
+                        getattr(record, 'price', None),
+                        getattr(record, 'size', None),
+                        getattr(record, 'order_ref', None),
+                        getattr(record, 'parent_ref', None)
+                    ))
+                    # Success - break out of retry loop
+                    break
+                finally:
+                    conn.close()
+                    
+            except sqlite3.OperationalError as e:
+                if attempt < max_retries - 1:  # Not the last attempt
+                    import time
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    # Last attempt failed - print error but don't crash
+                    print(f"DatabaseLogHandler: Failed to write log after {max_retries} attempts: {e}", file=sys.stderr)
+                    print(f"Database file: {self.db_file}", file=sys.stderr)
+                    print(f"File exists: {os.path.exists(self.db_file)}", file=sys.stderr)
+                    
+            except Exception as e:
+                # Other exceptions - print and continue
+                print(f"DatabaseLogHandler: Unexpected error: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                break
 
     def __del__(self):
         """The connection is no longer stored on the instance."""
@@ -165,7 +216,7 @@ def setup_logging():
     return logger
 
 # Global settings
-DB_FILE = "backtest_sell_limits.db"
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_sell_limits.db")
 TICKER_TABLE = "sp500_list_2025_jun"
 START_DATE = "2024-05-01"
 END_DATE = "2025-06-26"
