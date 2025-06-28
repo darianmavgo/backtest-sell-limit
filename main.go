@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"database/sql"
@@ -363,11 +364,8 @@ var (
 
 // SP500Stock represents a stock in the S&P 500 index
 type SP500Stock struct {
-	Symbol    string    `json:"symbol"`
-	Name      string    `json:"name"`
-	Sector    string    `json:"sector"`
-	Industry  string    `json:"industry"`
-	AddedDate time.Time `json:"added_date"`
+	Symbol       string `json:"symbol"`
+	SecurityName string `json:"security_name"`
 }
 
 func main() {
@@ -1682,7 +1680,7 @@ func (db *DB) saveHistoricalData(data []HistoricalData) error {
 
 // updateSP500Handler fetches the current S&P 500 list and updates the database
 func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodGet {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
 			Error:   "Method not allowed",
@@ -1694,10 +1692,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS sp500_list_2025_jun (
 			ticker TEXT PRIMARY KEY,
-			name TEXT,
-			sector TEXT,
-			industry TEXT,
-			added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			security_name TEXT
 		)
 	`)
 	if err != nil {
@@ -1708,7 +1703,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 		return
 	}
 
-	// Fetch S&P 500 constituents from Yahoo Finance
+	// Fetch S&P 500 constituents from local file
 	stocks, err := fetchSP500List()
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
@@ -1739,10 +1734,10 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 		return
 	}
 
-	// Insert new data
+	// Insert new stocks
 	stmt, err := tx.Prepare(`
-		INSERT INTO sp500_list_2025_jun (ticker, name, sector, industry)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO sp500_list_2025_jun (ticker, security_name)
+		VALUES (?, ?)
 	`)
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
@@ -1754,7 +1749,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	defer stmt.Close()
 
 	for _, stock := range stocks {
-		_, err = stmt.Exec(stock.Symbol, stock.Name, stock.Sector, stock.Industry)
+		_, err = stmt.Exec(stock.Symbol, stock.SecurityName)
 		if err != nil {
 			sendJSONResponse(w, HandlerResponse{
 				Success: false,
@@ -1779,6 +1774,101 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	})
 }
 
+// fetchSP500List fetches the current S&P 500 constituents from local HTML file
+func fetchSP500List() ([]SP500Stock, error) {
+	// Read the local HTML file
+	content, err := os.ReadFile("sp500.html")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sp500.html: %v", err)
+	}
+
+	// Parse the HTML document
+	doc, err := html.Parse(bytes.NewReader(content))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %v", err)
+	}
+
+	var stocks []SP500Stock
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "table" {
+			// Check if this is the S&P 500 table
+			for _, a := range n.Attr {
+				if a.Key == "id" && a.Val == "constituents" {
+					// Found the right table, now parse rows
+					var currentStock SP500Stock
+					var inRow bool
+					var colIndex int
+
+					var parseRow func(*html.Node)
+					parseRow = func(n *html.Node) {
+						if n.Type == html.ElementNode {
+							switch n.Data {
+							case "tr":
+								if n.Parent != nil && n.Parent.Data == "tbody" {
+									inRow = true
+									colIndex = 0
+									currentStock = SP500Stock{}
+								}
+							case "td":
+								if !inRow {
+									return
+								}
+								switch colIndex {
+								case 0: // Symbol column
+									// Find the first anchor tag
+									for c := n.FirstChild; c != nil; c = c.NextSibling {
+										if c.Type == html.ElementNode && c.Data == "a" {
+											if c.FirstChild != nil {
+												currentStock.Symbol = strings.TrimSpace(c.FirstChild.Data)
+											}
+											break
+										}
+									}
+								case 1: // Security Name column
+									// Find the first anchor tag
+									for c := n.FirstChild; c != nil; c = c.NextSibling {
+										if c.Type == html.ElementNode && c.Data == "a" {
+											if c.FirstChild != nil {
+												currentStock.SecurityName = strings.TrimSpace(c.FirstChild.Data)
+											}
+											break
+										}
+									}
+									// After getting both columns, add to stocks if valid
+									if currentStock.Symbol != "" && currentStock.SecurityName != "" {
+										stocks = append(stocks, currentStock)
+									}
+								}
+								colIndex++
+							}
+						}
+						for c := n.FirstChild; c != nil; c = c.NextSibling {
+							parseRow(c)
+						}
+					}
+
+					// Parse all rows in the table
+					for c := n.FirstChild; c != nil; c = c.NextSibling {
+						parseRow(c)
+					}
+					return
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+
+	if len(stocks) == 0 {
+		return nil, fmt.Errorf("no stocks found in HTML file")
+	}
+
+	return stocks, nil
+}
+
 // listSP500Handler returns the current list of S&P 500 stocks
 func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if r.Method != http.MethodGet {
@@ -1790,7 +1880,7 @@ func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	}
 
 	rows, err := db.Query(`
-		SELECT ticker, name, sector, industry, added_date
+		SELECT ticker
 		FROM sp500_list_2025_jun
 		ORDER BY ticker
 	`)
@@ -1806,7 +1896,7 @@ func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	var stocks []SP500Stock
 	for rows.Next() {
 		var stock SP500Stock
-		err := rows.Scan(&stock.Symbol, &stock.Name, &stock.Sector, &stock.Industry, &stock.AddedDate)
+		err := rows.Scan(&stock.Symbol)
 		if err != nil {
 			sendJSONResponse(w, HandlerResponse{
 				Success: false,
@@ -1819,62 +1909,4 @@ func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stocks)
-}
-
-// fetchSP500List fetches the current S&P 500 constituents from Yahoo Finance
-func fetchSP500List() ([]SP500Stock, error) {
-	// Yahoo Finance URL for S&P 500 components
-	url := "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&lang=en-US&region=US&scrId=user_f1c9c8d4-1&start=0&count=500"
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	// Add headers to mimic a browser request
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	req.Header.Add("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Finance struct {
-			Result []struct {
-				Quotes []struct {
-					Symbol   string `json:"symbol"`
-					LongName string `json:"longName"`
-					Sector   string `json:"sector"`
-					Industry string `json:"industry"`
-				} `json:"quotes"`
-			} `json:"result"`
-		} `json:"finance"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
-	}
-
-	if len(result.Finance.Result) == 0 || len(result.Finance.Result[0].Quotes) == 0 {
-		return nil, fmt.Errorf("no stocks found in response")
-	}
-
-	var stocks []SP500Stock
-	for _, quote := range result.Finance.Result[0].Quotes {
-		stocks = append(stocks, SP500Stock{
-			Symbol:   quote.Symbol,
-			Name:     quote.LongName,
-			Sector:   quote.Sector,
-			Industry: quote.Industry,
-		})
-	}
-
-	return stocks, nil
 }
