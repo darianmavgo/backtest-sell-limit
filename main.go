@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"crypto/tls"
+
 	"github.com/gomarkdown/markdown"
 	mdhtml "github.com/gomarkdown/markdown/html"
 	"github.com/gomarkdown/markdown/parser"
@@ -397,6 +399,9 @@ func main() {
 	})
 	http.HandleFunc("/api/sp500/list", func(w http.ResponseWriter, r *http.Request) {
 		listSP500Handler(w, r, dbWrapper)
+	})
+	http.HandleFunc("/api/stock/historical/fill", func(w http.ResponseWriter, r *http.Request) {
+		historicalDataHandler(w, r, dbWrapper)
 	})
 
 	// Start the server
@@ -1072,7 +1077,18 @@ func fetchStockData(ticker string) (*StockData, error) {
 	// Using Yahoo Finance API (free alternative)
 	url := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s", ticker)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Create a custom transport with TLS config
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Only for development/testing
+		},
+	}
+
+	// Create a new client with the custom transport
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: tr,
+	}
 
 	// Create request with User-Agent header (Yahoo Finance requires this)
 	req, err := http.NewRequest("GET", url, nil)
@@ -1291,21 +1307,28 @@ func sp500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 
 // historicalDataHandler handles the historical data fetching endpoint
 func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
-	// 1. Parse query parameters
-	tableName := r.URL.Query().Get("table")
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	symbol := r.URL.Query().Get("symbol")
-
-	if tableName == "" || startDateStr == "" || endDateStr == "" {
+	if r.Method != http.MethodGet {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   "Missing required query parameters: table, start_date, end_date",
+			Error:   "Method not allowed",
 		})
 		return
 	}
 
-	// 2. Parse dates
+	// Parse query parameters
+	startDateStr := r.URL.Query().Get("start_date")
+	endDateStr := r.URL.Query().Get("end_date")
+	symbol := r.URL.Query().Get("symbol")
+
+	if startDateStr == "" || endDateStr == "" {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Error:   "Missing required query parameters: start_date, end_date",
+		})
+		return
+	}
+
+	// Parse dates
 	layout := "2006-01-02"
 	startDate, err := time.Parse(layout, startDateStr)
 	if err != nil {
@@ -1324,10 +1347,9 @@ func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
 		return
 	}
 
-	log.Printf("Starting historical data fetch for table '%s' from %s to %s...", tableName, startDateStr, endDateStr)
+	log.Printf("Starting historical data fetch from %s to %s...", startDateStr, endDateStr)
 	start := time.Now()
 
-	// 3. Fetch historical data
 	var fetchErr error
 	if symbol != "" {
 		// Fetch data for a single symbol
@@ -1342,8 +1364,140 @@ func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
 		}
 		fetchErr = db.saveHistoricalData(data)
 	} else {
-		// Fetch data for all symbols in the table
-		fetchErr = fetchAllHistoricalData(db, tableName, startDate, endDate)
+		// Fetch data for all S&P 500 symbols
+		tickers, err := db.getActiveSP500Tickers()
+		if err != nil {
+			sendJSONResponse(w, HandlerResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Failed to get S&P 500 tickers: %v", err),
+			})
+			return
+		}
+
+		log.Printf("Found %d S&P 500 tickers to process", len(tickers))
+
+		// Use goroutines to fetch data concurrently
+		numWorkers := 20 // Back to 20 workers for better performance
+		jobs := make(chan string, len(tickers))
+		results := make(chan HistoricalResult, len(tickers))
+		rateLimiter := make(chan struct{}, numWorkers) // Rate limiter channel
+
+		// Start worker pool
+		var wg sync.WaitGroup
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for ticker := range jobs {
+					rateLimiter <- struct{}{} // Acquire rate limiter slot
+
+					log.Printf("Fetching historical data for %s", ticker)
+					data, err := fetchHistoricalTickerData(ticker, startDate, endDate)
+					if err != nil {
+						log.Printf("Error fetching historical data for %s: %v", ticker, err)
+						results <- HistoricalResult{Ticker: ticker, Err: err}
+						<-rateLimiter // Release rate limiter slot
+						continue
+					}
+
+					// Start a transaction for this symbol
+					tx, err := db.Begin()
+					if err != nil {
+						log.Printf("Error starting transaction for %s: %v", ticker, err)
+						results <- HistoricalResult{Ticker: ticker, Err: err}
+						<-rateLimiter // Release rate limiter slot
+						continue
+					}
+
+					// Prepare statement
+					stmt, err := tx.Prepare(`
+						INSERT OR REPLACE INTO stock_historical_data (
+							symbol, date, open, high, low, close, adj_close, volume
+						) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					`)
+					if err != nil {
+						tx.Rollback()
+						log.Printf("Error preparing statement for %s: %v", ticker, err)
+						results <- HistoricalResult{Ticker: ticker, Err: err}
+						<-rateLimiter // Release rate limiter slot
+						continue
+					}
+
+					// Insert all data points for this symbol
+					for _, d := range data {
+						_, err := stmt.Exec(
+							d.Symbol,
+							d.Date.Unix(),
+							d.Open,
+							d.High,
+							d.Low,
+							d.Close,
+							d.AdjClose,
+							d.Volume,
+						)
+						if err != nil {
+							tx.Rollback()
+							stmt.Close()
+							log.Printf("Error inserting data for %s: %v", ticker, err)
+							results <- HistoricalResult{Ticker: ticker, Err: err}
+							<-rateLimiter // Release rate limiter slot
+							continue
+						}
+					}
+
+					// Commit transaction
+					stmt.Close()
+					if err := tx.Commit(); err != nil {
+						log.Printf("Error committing transaction for %s: %v", ticker, err)
+						results <- HistoricalResult{Ticker: ticker, Err: err}
+						<-rateLimiter // Release rate limiter slot
+						continue
+					}
+
+					results <- HistoricalResult{Ticker: ticker, Data: data}
+					<-rateLimiter // Release rate limiter slot
+				}
+			}()
+		}
+
+		// Send jobs to workers
+		for _, ticker := range tickers {
+			jobs <- ticker
+		}
+		close(jobs)
+
+		// Wait for all workers to complete
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		// Process results with progress tracking
+		var errors []error
+		var successCount int
+		totalTickers := len(tickers)
+		for result := range results {
+			if result.Err != nil {
+				errors = append(errors, fmt.Errorf("%s: %v", result.Ticker, result.Err))
+			} else {
+				successCount++
+			}
+			// Log progress every 10 tickers
+			if (successCount+len(errors))%10 == 0 {
+				log.Printf("Progress: %d/%d tickers processed (%d successful, %d failed)",
+					successCount+len(errors), totalTickers, successCount, len(errors))
+			}
+		}
+
+		if len(errors) > 0 {
+			// Log all errors but only return the first one in the response
+			for _, err := range errors {
+				log.Printf("Error: %v", err)
+			}
+			fetchErr = fmt.Errorf("encountered %d errors while processing tickers: %v", len(errors), errors[0])
+		}
+
+		log.Printf("Final results: %d/%d tickers processed successfully", successCount, totalTickers)
 	}
 
 	if fetchErr != nil {
@@ -1364,147 +1518,72 @@ func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
 	})
 }
 
-// getTickersFromTable fetches ticker symbols from a specified table
-func (db *DB) getTickersFromTable(tableName string) ([]string, error) {
-	// Sanitize table name to prevent SQL injection
-	// A simple approach is to allow only alphanumeric characters and underscores
-	if matched, _ := regexp.MatchString(`^[a-zA-Z0-9_]+$`, tableName); !matched {
-		return nil, fmt.Errorf("invalid table name: %s", tableName)
-	}
-
-	query := fmt.Sprintf("SELECT ticker FROM %s WHERE is_active = 1 ORDER BY ticker", tableName)
-	rows, err := db.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tickers from %s: %v", tableName, err)
-	}
-	defer rows.Close()
-
-	var tickers []string
-	for rows.Next() {
-		var ticker string
-		if err := rows.Scan(&ticker); err != nil {
-			return nil, fmt.Errorf("failed to scan ticker: %v", err)
-		}
-		tickers = append(tickers, ticker)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("row iteration error: %v", err)
-	}
-
-	return tickers, nil
-}
-
-// fetchAllHistoricalData fetches historical data for all tickers from a given table
-func fetchAllHistoricalData(db *DB, tableName string, startDate, endDate time.Time) error {
-	log.Printf("Starting historical data fetch for table %s from %s to %s", tableName, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
-
-	tickers, err := db.getTickersFromTable(tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get ticker list: %v", err)
-	}
-
-	log.Printf("Found %d tickers in table %s", len(tickers), tableName)
-	if len(tickers) == 0 {
-		return fmt.Errorf("no active tickers found in table %s", tableName)
-	}
-
-	numWorkers := 20
-	jobs := make(chan string, len(tickers))
-	results := make(chan HistoricalResult, len(tickers))
-
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ticker := range jobs {
-				log.Printf("Fetching historical data for %s", ticker)
-				historicalData, err := fetchHistoricalTickerData(ticker, startDate, endDate)
-				if err != nil {
-					log.Printf("Error fetching historical data for %s: %v", ticker, err)
-					results <- HistoricalResult{Ticker: ticker, Err: err}
-					continue
-				}
-
-				log.Printf("Saving %d data points for %s", len(historicalData), ticker)
-				if err := db.saveHistoricalData(historicalData); err != nil {
-					log.Printf("Error saving historical data for %s: %v", ticker, err)
-					results <- HistoricalResult{Ticker: ticker, Err: err}
-					continue
-				}
-
-				results <- HistoricalResult{Ticker: ticker, Data: historicalData}
-			}
-		}()
-	}
-
-	for _, ticker := range tickers {
-		jobs <- ticker
-	}
-	close(jobs)
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var errors []error
-	var successCount int
-	for result := range results {
-		if result.Err != nil {
-			errors = append(errors, result.Err)
-		} else {
-			successCount++
-		}
-	}
-
-	log.Printf("Successfully fetched and saved historical data for %d out of %d tickers", successCount, len(tickers))
-
-	if len(errors) > 0 {
-		log.Printf("Encountered %d errors while fetching historical data", len(errors))
-		for i, err := range errors {
-			if i >= 5 {
-				break
-			}
-			log.Printf("Error %d: %v", i+1, err)
-		}
-	}
-
-	return nil
-}
-
 // fetchHistoricalTickerData fetches historical data for a single ticker from Yahoo Finance
 func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]HistoricalData, error) {
-	// Yahoo Finance uses Unix timestamps for period1 and period2
-	p1 := startDate.Unix()
-	p2 := endDate.Unix()
+	// Yahoo Finance API URL
+	url := fmt.Sprintf(
+		"https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includeAdjustedClose=true",
+		ticker,
+		startDate.Unix(),
+		endDate.Unix(),
+	)
 
-	url := fmt.Sprintf("https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includeAdjustedClose=true", ticker, p1, p2)
+	// Create a custom transport with TLS config
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Only for development/testing
+		},
+	}
 
-	client := &http.Client{Timeout: 20 * time.Second}
+	// Create a new client with the custom transport
+	client := &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: tr,
+	}
+
+	// Create a new request
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request for %s: %v", ticker, err)
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
 	// Add required headers
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Origin", "https://finance.yahoo.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://finance.yahoo.com/quote/%s", ticker))
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data for %s: %v", ticker, err)
+	// Make the request with retries
+	var resp *http.Response
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		resp, err = client.Do(req)
+		if err != nil {
+			if i == maxRetries-1 {
+				return nil, fmt.Errorf("failed to fetch data after %d retries: %v", maxRetries, err)
+			}
+			time.Sleep(time.Duration(i+1) * time.Second)
+			continue
+		}
+
+		if resp.StatusCode == 429 { // Too Many Requests
+			if i == maxRetries-1 {
+				return nil, fmt.Errorf("rate limit exceeded after %d retries", maxRetries)
+			}
+			time.Sleep(time.Duration(i+1) * 2 * time.Second)
+			resp.Body.Close()
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
+		}
+		break
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed for %s: status %d", ticker, resp.StatusCode)
-	}
 
 	// Handle gzip compression
 	var reader io.Reader
@@ -1512,7 +1591,7 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 	case "gzip":
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create gzip reader for %s: %v", ticker, err)
+			return nil, fmt.Errorf("failed to create gzip reader: %v", err)
 		}
 		defer gzReader.Close()
 		reader = gzReader
@@ -1520,17 +1599,19 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 		reader = resp.Body
 	}
 
+	// Read response body
 	body, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response for %s: %v", ticker, err)
+		return nil, fmt.Errorf("failed to read response: %v", err)
 	}
 
 	// Parse JSON response
-	var response struct {
+	var yahooResp struct {
 		Chart struct {
 			Result []struct {
 				Meta struct {
-					Symbol string `json:"symbol"`
+					Symbol string  `json:"symbol"`
+					First  float64 `json:"firstTradeDate"`
 				} `json:"meta"`
 				Timestamp  []int64 `json:"timestamp"`
 				Indicators struct {
@@ -1546,29 +1627,29 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 					} `json:"adjclose"`
 				} `json:"indicators"`
 			} `json:"result"`
-			Error interface{} `json:"error"`
+			Error *struct {
+				Code        string `json:"code"`
+				Description string `json:"description"`
+			} `json:"error"`
 		} `json:"chart"`
 	}
 
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON for %s: %v", ticker, err)
+	if err := json.Unmarshal(body, &yahooResp); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v, body: %s", err, string(body))
 	}
 
-	if response.Chart.Error != nil {
-		return nil, fmt.Errorf("API error for %s: %v", ticker, response.Chart.Error)
+	// Check for API errors
+	if yahooResp.Chart.Error != nil {
+		return nil, fmt.Errorf("API error: %s - %s", yahooResp.Chart.Error.Code, yahooResp.Chart.Error.Description)
 	}
 
-	if len(response.Chart.Result) == 0 {
-		return nil, fmt.Errorf("no data returned for %s", ticker)
+	if len(yahooResp.Chart.Result) == 0 {
+		return nil, fmt.Errorf("no data returned")
 	}
 
-	result := response.Chart.Result[0]
-	if len(result.Timestamp) == 0 {
-		return nil, fmt.Errorf("no timestamps returned for %s", ticker)
-	}
-
-	if len(result.Indicators.Quote) == 0 || len(result.Indicators.Adjclose) == 0 {
-		return nil, fmt.Errorf("no price data returned for %s", ticker)
+	result := yahooResp.Chart.Result[0]
+	if len(result.Indicators.Quote) == 0 {
+		return nil, fmt.Errorf("no quote data returned")
 	}
 
 	quote := result.Indicators.Quote[0]
@@ -1581,10 +1662,9 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 			continue
 		}
 
-		date := time.Unix(ts, 0)
 		historicalData = append(historicalData, HistoricalData{
 			Symbol:   ticker,
-			Date:     date,
+			Date:     time.Unix(ts, 0),
 			Open:     quote.Open[i],
 			High:     quote.High[i],
 			Low:      quote.Low[i],
@@ -1593,6 +1673,9 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]H
 			Volume:   quote.Volume[i],
 		})
 	}
+
+	// Add delay to avoid rate limiting
+	time.Sleep(100 * time.Millisecond)
 
 	return historicalData, nil
 }
@@ -1603,22 +1686,25 @@ func (db *DB) saveHistoricalData(data []HistoricalData) error {
 		return nil
 	}
 
+	// Start a transaction
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
+	defer tx.Rollback() // Will be ignored if transaction is committed
 
+	// Prepare the statement
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO stock_historical_data (
 			symbol, date, open, high, low, close, adj_close, volume
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
-		tx.Rollback()
 		return fmt.Errorf("failed to prepare statement: %v", err)
 	}
 	defer stmt.Close()
 
+	// Insert all data points in a single transaction
 	for _, d := range data {
 		_, err := stmt.Exec(
 			d.Symbol,
@@ -1631,14 +1717,12 @@ func (db *DB) saveHistoricalData(data []HistoricalData) error {
 			d.Volume,
 		)
 		if err != nil {
-			tx.Rollback()
-			log.Printf("Error inserting data for %s on %s: %v", d.Symbol, d.Date.Format("2006-01-02"), err)
 			return fmt.Errorf("failed to insert historical data for %s on %s: %v", d.Symbol, d.Date.String(), err)
 		}
 	}
 
+	// Commit the transaction
 	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction: %v", err)
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
