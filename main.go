@@ -19,6 +19,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gomarkdown/markdown"
+	mdhtml "github.com/gomarkdown/markdown/html"
+	"github.com/gomarkdown/markdown/parser"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
@@ -369,72 +372,36 @@ type SP500Stock struct {
 }
 
 func main() {
-	// Initialize database
-	sqlDB, err := sql.Open("sqlite3", dbFile)
+	// Initialize the database
+	db, err := initDB()
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer sqlDB.Close()
+	defer db.Close()
 
-	db := NewDB(sqlDB)
+	dbWrapper := NewDB(db)
 
-	// Create tables if they don't exist
-	if err := createTables(db.DB); err != nil {
-		log.Fatalf("Failed to create tables: %v", err)
-	}
-
-	// Initialize OAuth config
-	credBytes, err := os.ReadFile(credentialsFile)
-	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
-	}
-
-	var credInfo CredentialInfo
-	if err := json.Unmarshal(credBytes, &credInfo); err != nil {
-		log.Fatalf("Unable to parse client secret file: %v", err)
-	}
-
-	config = &oauth2.Config{
-		ClientID:     credInfo.Web.ClientID,
-		ClientSecret: credInfo.Web.ClientSecret,
-		RedirectURL:  "http://localhost:8080/callback",
-		Scopes: []string{
-			gmail.GmailReadonlyScope,
-		},
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  credInfo.Web.AuthURI,
-			TokenURL: credInfo.Web.TokenURI,
-		},
-	}
-
-	// Set up HTTP handlers
+	// Set up routes
 	http.HandleFunc("/", handleHome)
 	http.HandleFunc("/login", handleGoogleLogin)
 	http.HandleFunc("/callback", handleGoogleCallback)
+	http.HandleFunc("/readme", readmeHandler)
 	http.HandleFunc("/batchget", func(w http.ResponseWriter, r *http.Request) {
-		batchGetHandler(w, r, db)
+		batchGetHandler(w, r, dbWrapper)
 	})
 	http.HandleFunc("/fixdate", func(w http.ResponseWriter, r *http.Request) {
-		fixDateHandler(w, r, db)
-	})
-	http.HandleFunc("/sp500", func(w http.ResponseWriter, r *http.Request) {
-		sp500Handler(w, r, db)
-	})
-	http.HandleFunc("/historical-data", func(w http.ResponseWriter, r *http.Request) {
-		historicalDataHandler(w, r, db)
+		fixDateHandler(w, r, dbWrapper)
 	})
 	http.HandleFunc("/api/sp500/update", func(w http.ResponseWriter, r *http.Request) {
-		updateSP500Handler(w, r, db)
+		updateSP500Handler(w, r, dbWrapper)
 	})
 	http.HandleFunc("/api/sp500/list", func(w http.ResponseWriter, r *http.Request) {
-		listSP500Handler(w, r, db)
+		listSP500Handler(w, r, dbWrapper)
 	})
 
 	// Start the server
-	log.Printf("Server starting on port%s...\n", serverPort)
-	if err := http.ListenAndServe(serverPort, nil); err != nil {
-		log.Fatal(err)
-	}
+	fmt.Printf("Server is running on port %s\n", serverPort)
+	log.Fatal(http.ListenAndServe(serverPort, nil))
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
@@ -1909,4 +1876,84 @@ func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stocks)
+}
+
+func readmeHandler(w http.ResponseWriter, r *http.Request) {
+	// Read the README.md file
+	content, err := os.ReadFile("README.md")
+	if err != nil {
+		http.Error(w, "Failed to read README.md", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert markdown to HTML
+	html := markdownToHTML(content)
+
+	// Add CSS styling
+	styledHTML := fmt.Sprintf(`
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<meta charset="UTF-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1.0">
+			<title>API Documentation</title>
+			<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown.min.css">
+			<style>
+				.markdown-body {
+					box-sizing: border-box;
+					min-width: 200px;
+					max-width: 980px;
+					margin: 0 auto;
+					padding: 45px;
+				}
+				@media (max-width: 767px) {
+					.markdown-body {
+						padding: 15px;
+					}
+				}
+				body {
+					background-color: #f6f8fa;
+				}
+				pre {
+					background-color: #f6f8fa;
+					border-radius: 6px;
+					padding: 16px;
+					overflow: auto;
+				}
+				code {
+					background-color: rgba(175,184,193,0.2);
+					border-radius: 6px;
+					padding: 0.2em 0.4em;
+					font-size: 85%%;
+				}
+			</style>
+		</head>
+		<body>
+			<article class="markdown-body">
+				%s
+			</article>
+		</body>
+		</html>
+	`, html)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(styledHTML))
+}
+
+func markdownToHTML(md []byte) string {
+	// Create a markdown parser with extensions
+	extensions := parser.CommonExtensions | parser.AutoHeadingIDs | parser.NoEmptyLineBeforeBlock
+	p := parser.NewWithExtensions(extensions)
+
+	// Parse the markdown content
+	parsedContent := p.Parse(md)
+
+	// Create HTML renderer with default options
+	htmlFlags := mdhtml.CommonFlags | mdhtml.HrefTargetBlank
+	opts := mdhtml.RendererOptions{Flags: htmlFlags}
+	renderer := mdhtml.NewRenderer(opts)
+
+	// Convert to HTML
+	html := markdown.Render(parsedContent, renderer)
+	return string(html)
 }

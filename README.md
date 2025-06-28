@@ -1,74 +1,121 @@
 # Backtest Sell Limit
 
-A Go web application that processes Gmail backtest emails and fetches S&P 500 stock data.
+A Python and Go application for backtesting stock portfolio strategies with a focus on sell limit orders.
 
 ## Features
 
-### Gmail Integration
-- Login with Google OAuth2
-- Fetch emails with specific labels
-- Store email content in SQLite database
-- Fix email dates from various formats
+### Portfolio Backtesting
+- Backtest various portfolio strategies
+- Support for bracket order strategies
+- Historical data analysis
+- Performance metrics calculation
+- SQLite database for storing backtest results
 
-### S&P 500 Stock Data
-- Fetch real-time stock data for all S&P 500 companies
-- Concurrent processing using goroutines for fast data retrieval
-- Store comprehensive stock information including:
-  - Current price and price changes
-  - Volume and market cap
-  - Daily high/low and 52-week high/low
-  - Previous close and opening prices
-- SQLite database storage with proper indexing
+### Database Management
+- Centralized SQLite connection management
+- Transaction handling and error recovery
+- Efficient query execution
+- Comprehensive logging system
 
-## Endpoints
+### Strategy Implementation
+- Modular strategy framework
+- Bracket order strategy implementation
+- Portfolio strategy implementation
+- Easy to extend with new strategies
 
-- `/` - Home page with navigation
-- `/login` - Google OAuth2 login
-- `/callback` - OAuth2 callback handler
-- `/batchget` - Fetch emails from Gmail
-- `/fixdate` - Fix email dates
-- `/sp500` - Fetch S&P 500 stock data (NEW)
+## Project Structure
 
-## Usage
-
-1. Start the server:
-   ```bash
-   go run main.go
-   ```
-
-2. Open http://localhost:8080 in your browser
-
-3. Use the web interface to:
-   - Login with Google for email processing
-   - Fetch S&P 500 data using the "Fetch S&P 500 Data" button
+```
+backtest-sell-limit/
+├── strategies/           # Strategy implementations
+│   ├── bracket_strategy.py
+│   └── portfolio_strategy.py
+├── tests/               # Test suite
+│   ├── conftest.py
+│   └── test_portfolio_backtest.py
+├── sql/                 # SQL queries
+│   ├── create_tables/
+│   └── queries/
+├── portfolio_backtest.py # Main backtesting logic
+├── db_manager.py        # Database connection management
+└── database_log_handler.py # Logging system
+```
 
 ## Database Schema
 
-### Emails Table
-Stores processed Gmail messages with headers and content.
+### Backtest Tables
+1. `backtest_strategies`
+   - Strategy configuration and parameters
+   - Execution timestamps
+   - Performance metrics
 
-### Stock Data Table
-Stores S&P 500 stock information with the following fields:
-- symbol, company_name, price, change_amount, change_percent
-- volume, market_cap, previous_close, open_price
-- high, low, fifty_two_week_high, fifty_two_week_low
-- last_updated timestamp
+2. `backtest_daily_values`
+   - Daily portfolio values
+   - Asset allocations
+   - Transaction records
 
-## Performance
+3. `logs`
+   - Detailed execution logs
+   - Error tracking
+   - Performance monitoring
 
-The S&P 500 data fetching uses:
-- 20 concurrent goroutines for parallel API calls
-- Worker pool pattern for efficient resource management
-- Timeout handling for API requests
-- Error handling and logging for failed requests
+## Development
 
-## Dependencies
+### Requirements
+- Python 3.8+
+- SQLite3
+- Required Python packages in `requirements.txt`
+- Development dependencies in `requirements-dev.txt`
 
-- SQLite3 for database storage
-- Google APIs for Gmail integration
-- Yahoo Finance API for stock data
-- Standard Go libraries for HTTP and concurrency
+### Setup
+1. Clone the repository
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
 
-## Configuration
+### Running Tests
+```bash
+pytest tests/
+```
 
-Update the `credentialsFile` constant in `main.go` with your Google OAuth2 credentials file path. 
+### Running Backtests
+```bash
+./run_backtest.sh
+```
+
+## Architecture
+
+### Database Connection Management
+- Singleton SQLiteConnectionManager class
+- Automatic connection recovery
+- Transaction management
+- Query execution with error handling
+
+### Logging System
+- Custom DatabaseLogHandler
+- Structured logging to SQLite
+- Query-based log analysis
+- Performance monitoring
+
+### Strategy Framework
+- Abstract base classes for strategies
+- Standardized interface for new strategies
+- Built-in performance metrics
+- Historical data integration
+
+## Performance Optimization
+- Efficient database queries
+- Connection pooling
+- Transaction batching
+- Indexed database tables
+
+## Contributing
+1. Fork the repository
+2. Create a feature branch
+3. Implement changes with tests
+4. Submit a pull request
+
+## License
+[Add your license here] 
