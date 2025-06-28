@@ -6,214 +6,10 @@ import warnings
 import logging
 import sys
 import os
-
-def load_sql_query(filename):
-    """Load SQL query from file in sql/ directory"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sql_path = os.path.join(script_dir, "sql", filename)
-    with open(sql_path, 'r') as f:
-        return f.read().strip()
-
-class BracketStrategy(bt.Strategy):
-    """
-    This strategy implements a bracket order that buys 1 share of every
-    available stock at the market price. Once a buy order is executed,
-    it automatically places a limit sell order to take profit at 20%
-    above the execution price. It does not include a stop-loss leg.
-    """
-
-    def log(self, txt, dt=None):
-        """ Logging function for this strategy """
-        dt = dt or self.datas[0].datetime.date(0)
-        print(f'{dt.isoformat()} - {txt}')
-
-    def __init__(self):
-        """
-        Conception: __init__ is called when the strategy is created.
-        We can initialize attributes here. For this strategy, no
-        special indicators or attributes are needed initially.
-        """
-        self.log('Strategy Initialized')
-        # This dictionary will keep track of the take-profit sell order
-        # associated with each stock's buy order.
-        self.profit_takers = {}
-
-
-    def notify_order(self, order):
-        """
-        This method is called for any status change in an order.
-        It is the heart of our bracket order logic.
-        """
-        # 1. If order is submitted/accepted, do nothing
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-
-        # 2. Check if an order has been completed
-        if order.status in [order.Completed]:
-            if order.isbuy():
-                # This was a buy order that has been executed
-                self.log(
-                    f'BUY EXECUTED for {order.data._name}: '
-                    f'Price: {order.executed.price:.2f}, '
-                    f'Size: {order.executed.size}, '
-                    f'Cost: {order.executed.value:.2f}'
-                )
-
-                # --- BRACKET LOGIC ---
-                # Calculate the take profit price (20% above execution price)
-                profit_price = order.executed.price * 1.20
-
-                # Create the corresponding limit sell order to take profit
-                self.log(
-                    f'CREATING TAKE PROFIT SELL for {order.data._name} '
-                    f'at Price: {profit_price:.2f}'
-                )
-                profit_order = self.sell(
-                    data=order.data,
-                    size=order.executed.size,
-                    price=profit_price,
-                    exectype=bt.Order.Limit
-                )
-                # Store the reference to the profit-taking order
-                self.profit_takers[order.data._name] = profit_order
-
-            elif order.issell():
-                # This was a sell order that has been executed
-                self.log(
-                    f'SELL EXECUTED (Take Profit) for {order.data._name}: '
-                    f'Price: {order.executed.price:.2f}, '
-                    f'Size: {order.executed.size}, '
-                    f'Value: {order.executed.value:.2f}'
-                )
-                # Since the sell order (our profit taker) executed,
-                # we can remove its reference.
-                if order.data._name in self.profit_takers:
-                    del self.profit_takers[order.data._name]
-
-
-        # 3. Handle other order statuses like Canceled, Margin, or Rejected
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log(f'Order for {order.data._name} was Canceled/Margin/Rejected')
-
-
-    def start(self):
-        """
-        Birth: This method is called once the minimum period of all
-        indicators is met. Since we have no indicators, it's called
-        at the very beginning. We use it to place our initial buy orders.
-        """
-        self.log('Strategy Starting. Placing initial buy orders.')
-        for d in self.datas:
-            # Place a market order to buy 1 share of each stock
-            self.buy(data=d, size=1)
-
-    def stop(self):
-        """
-        Death: This method is called at the end of the backtest.
-        A good place to print final results.
-        """
-        self.log(f'Strategy Stopping. Final Portfolio Value: {self.broker.getvalue():.2f}')
-
-class DatabaseLogHandler(logging.Handler):
-    """A custom logging handler that writes logs to an SQLite database."""
-    def __init__(self, db_file, timeout=5.0):
-        super().__init__()
-        self.db_file = db_file
-        self.timeout = timeout
-        
-        # Ensure the directory exists
-        db_dir = os.path.dirname(self.db_file)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            
-        self.create_table()
-
-    def create_table(self):
-        """Create the logs table if it doesn't exist."""
-        try:
-            with sqlite3.connect(self.db_file, timeout=self.timeout) as conn:
-                conn.execute(load_sql_query("create_logs_table.sql"))
-                conn.commit()
-        except sqlite3.OperationalError as e:
-            print(f"DatabaseLogHandler: Error creating table: {e}", file=sys.stderr)
-            print(f"Database file: {self.db_file}", file=sys.stderr)
-            # Try to create a backup database file
-            backup_db = self.db_file + ".backup"
-            try:
-                with sqlite3.connect(backup_db, timeout=self.timeout) as conn:
-                    conn.execute(load_sql_query("create_logs_table.sql"))
-                    conn.commit()
-                    self.db_file = backup_db
-                    print(f"Created backup database: {backup_db}", file=sys.stderr)
-            except Exception as backup_error:
-                print(f"Failed to create backup database: {backup_error}", file=sys.stderr)
-
-    def emit(self, record):
-        """Emit a log record."""
-        max_retries = 3
-        retry_delay = 0.1
-        
-        for attempt in range(max_retries):
-            try:
-                # Use absolute path and add additional connection parameters for reliability
-                conn = sqlite3.connect(
-                    self.db_file, 
-                    timeout=self.timeout,
-                    check_same_thread=False,
-                    isolation_level=None  # Autocommit mode
-                )
-                try:
-                    message = self.format(record)
-                    conn.execute(load_sql_query("insert_log_entry.sql"), (
-                        datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f'),
-                        record.name,
-                        record.levelname,
-                        message,
-                        getattr(record, 'symbol', None),
-                        getattr(record, 'order_type', None),
-                        getattr(record, 'status', None),
-                        getattr(record, 'price', None),
-                        getattr(record, 'size', None),
-                        getattr(record, 'order_ref', None),
-                        getattr(record, 'parent_ref', None)
-                    ))
-                    # Success - break out of retry loop
-                    break
-                finally:
-                    conn.close()
-                    
-            except sqlite3.OperationalError as e:
-                if attempt < max_retries - 1:  # Not the last attempt
-                    import time
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
-                else:
-                    # Last attempt failed - print error but don't crash
-                    print(f"DatabaseLogHandler: Failed to write log after {max_retries} attempts: {e}", file=sys.stderr)
-                    print(f"Database file: {self.db_file}", file=sys.stderr)
-                    print(f"File exists: {os.path.exists(self.db_file)}", file=sys.stderr)
-                    
-            except Exception as e:
-                # Other exceptions - print and continue
-                print(f"DatabaseLogHandler: Unexpected error: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                break
-
-    def __del__(self):
-        """The connection is no longer stored on the instance."""
-        pass
-
-def setup_logging():
-    """Configure logging to use the DatabaseLogHandler."""
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    # Clear any existing handlers
-    logger.handlers = []
-    db_handler = DatabaseLogHandler(DB_FILE)
-    logger.addHandler(db_handler)
-    return logger
+import atexit
+from database_log_handler import DatabaseLogHandler
+from db_manager import SQLiteConnectionManager
+from strategies import BracketStrategy, PortfolioStrategy
 
 # Global settings
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_sell_limits.db")
@@ -222,29 +18,38 @@ START_DATE = "2024-05-01"
 END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0 # A large amount to ensure any trade can be made
 
+# Global database connection
+db = SQLiteConnectionManager(DB_FILE)
+
 def get_sp500_tickers():
     """Fetches the list of S&P 500 tickers from the SQLite database."""
     try:
-        con = sqlite3.connect(DB_FILE)
-        query_template = load_sql_query("get_sp500_tickers.sql")
-        query = query_template.format(ticker_table=TICKER_TABLE)
-        df = pd.read_sql_query(query, con)
+        query = db.load_sql_query("get_sp500_tickers.sql").format(ticker_table=TICKER_TABLE)
+        df = pd.read_sql_query(query, db.get_connection())
         return df['ticker'].tolist()
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower() or "unable to open database file" in str(e).lower():
+            if db.kill_locks():
+                # Retry after clearing locks
+                try:
+                    df = pd.read_sql_query(query, db.get_connection())
+                    return df['ticker'].tolist()
+                except Exception as retry_error:
+                    print(f"Error fetching tickers after lock cleanup: {retry_error}")
+                    return []
+        print(f"Database error fetching tickers: {e}")
+        return []
     except Exception as e:
         print(f"Error fetching tickers: {e}")
         return []
-    finally:
-        if 'con' in locals() and con:
-            con.close()
 
 def get_historical_data(symbol, start_date, end_date):
     """Get historical data for a symbol from SQLite database"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        query = load_sql_query("get_historical_data.sql")
+        query = db.load_sql_query("get_historical_data.sql")
         df = pd.read_sql_query(
             query, 
-            conn, 
+            db.get_connection(), 
             params=[symbol, start_date, end_date],
             parse_dates={'date': '%Y-%m-%d %H:%M:%S'}
         )
@@ -253,12 +58,9 @@ def get_historical_data(symbol, start_date, end_date):
     except Exception as e:
         logging.error(f"Error fetching historical data for {symbol}: {e}")
         return None
-    finally:
-        conn.close()
 
 def save_backtest_results(strategy_name, daily_values, initial_value, final_value, total_return):
     """Save backtest results to SQLite database"""
-    conn = sqlite3.connect(DB_FILE)
     try:
         logging.info(f"Saving backtest results for strategy: {strategy_name}")
         logging.info(f"Initial value: ${initial_value:,.2f}")
@@ -267,129 +69,56 @@ def save_backtest_results(strategy_name, daily_values, initial_value, final_valu
         logging.info(f"Number of daily values: {len(daily_values)}")
         
         # Create tables if they don't exist
-        conn.execute(load_sql_query("create_backtest_strategies_table.sql"))
-        conn.execute(load_sql_query("create_backtest_daily_values_table.sql"))
+        db.execute_sql_file("create_backtest_strategies_table.sql")
+        db.execute_sql_file("create_backtest_daily_values_table.sql")
         
         # NOTE: backtest_order_history table is no longer created or used.
         # All order history is now in the 'logs' table.
 
         # Save strategy performance
-        conn.execute(load_sql_query("insert_backtest_strategy.sql"), 
-                    (strategy_name, START_DATE, END_DATE, initial_value, final_value, total_return))
+        db.execute_sql_file("insert_backtest_strategy.sql", 
+                          (strategy_name, START_DATE, END_DATE, initial_value, final_value, total_return))
         logging.info("Saved strategy performance")
 
         # Save daily values
         for date, value in daily_values:
-            conn.execute(load_sql_query("insert_backtest_daily_value.sql"), 
-                        (strategy_name, date.strftime('%Y-%m-%d'), value))
+            db.execute_sql_file("insert_backtest_daily_value.sql", 
+                              (strategy_name, date.strftime('%Y-%m-%d'), value))
         logging.info("Saved daily values")
 
         # NOTE: Order history is no longer saved here. It's logged directly.
 
-        conn.commit()
+        db.commit()
         logging.info("Database changes committed")
     except Exception as e:
         logging.error(f"Error saving backtest results: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
+        db.rollback()
 
-class PortfolioStrategy(bt.Strategy):
-    """A strategy that buys stocks and sets sell limits at 20% above purchase price"""
-    
-    def __init__(self):
-        self.orders = {}  # Keep track of buy orders
-        self.sell_orders = {}  # Keep track of sell limit orders
-        self.initial_cash = self.broker.getvalue()
-        self.stocks_bought = False
-        self.purchase_prices = {}  # Keep track of purchase prices
-        self.daily_values = []  # Track daily portfolio values
-        
-    def next(self):
-        # Track daily portfolio value
-        self.daily_values.append((self.datetime.date(), self.broker.getvalue()))
-        
-        # Buy stocks on the first day
-        if not self.stocks_bought:
-            for data in self.datas:
-                # Check if we have data
-                if len(data) > 0:
-                    # Buy 1 share of each stock using bracket order
-                    size = 1
-                    
-                    # Calculate target price (20% above current price)
-                    current_price = data.close[0]
-                    target_price = current_price * 1.20
-                    
-                    # Create market buy order first
-                    buy_order = self.buy(data=data, size=size)
-                    
-                    # Create sell limit order at target price
-                    sell_order = self.sell(data=data, 
-                                         size=size, 
-                                         exectype=bt.Order.Limit,
-                                         price=target_price,
-                                         parent=buy_order,
-                                         transmit=True)
-                    
-                    self.purchase_prices[data._name] = current_price
-                    logging.info(
-                        f"Placed bracket order for {data._name}", 
-                        extra={'symbol': data._name, 'price': current_price}
-                    )
-                else:
-                    logging.warning(f"No data available for {data._name}", extra={'symbol': data._name})
-            
-            self.stocks_bought = True
-    
-    def notify_order(self, order):
-        """Log order notifications to the database."""
-        extra_data = {
-            'symbol': order.data._name,
-            'order_type': order.ordtypename(),
-            'status': order.getstatusname(),
-            'order_ref': order.ref,
-            'parent_ref': order.parent.ref if order.parent else None
-        }
-        
-        message = f"Order Notification: {order.data._name} - {order.ordtypename()} - {order.getstatusname()}"
-
-        if order.status == order.Completed:
-            extra_data['price'] = order.executed.price
-            extra_data['size'] = order.executed.size
-            message = f"Order Completed: {order.data._name} - {order.ordtypename()} at {order.executed.price}"
-            logging.info(message, extra=extra_data)
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            logging.warning(message, extra=extra_data)
-        else: # Submitted, Accepted, Partial
-            logging.info(message, extra=extra_data)
-
-    def stop(self):
-        # Calculate return
-        final_value = self.broker.getvalue()
-        total_return = (final_value - self.initial_cash) / self.initial_cash * 100
-        
-        # Save results
-        save_backtest_results(
-            "PortfolioStrategy_20_percent_sell_limit",
-            self.daily_values,
-            self.initial_cash,
-            final_value,
-            total_return
-        )
+def clear_backtest_history(strategy_name):
+    """Clears all previous backtest data for a given strategy and the logs."""
+    try:
+        logging.info(f"Clearing backtest history for strategy: {strategy_name}")
+        # Execute each DROP statement from the SQL file
+        drop_statements = db.load_sql_query("clear_backtest_tables.sql").split(';')
+        for statement in drop_statements:
+            if statement.strip():
+                db.execute(statement)
+        db.commit()
+        logging.info("Successfully cleared backtest history and logs.")
+    except Exception as e:
+        # Use print because logger might not be configured yet or is being cleared
+        print(f"Error clearing backtest history: {e}")
+        db.rollback()
 
 def get_portfolio_data():
     """Get current portfolio data from SQLite database"""
     try:
-        con = sqlite3.connect(DB_FILE)
-        query = load_sql_query("get_portfolio_data.sql")
-        df = pd.read_sql_query(query, con)
+        query = db.load_sql_query("get_portfolio_data.sql")
+        df = pd.read_sql_query(query, db.get_connection())
         return df
     except Exception as e:
         print(f"Error fetching portfolio data: {e}")
         return pd.DataFrame()
-    finally:
-        con.close()
 
 def calculate_portfolio_value():
     """Calculate current portfolio value"""
@@ -400,23 +129,15 @@ def calculate_portfolio_value():
     total_value = (df['shares'] * df['current_price']).sum()
     return total_value
 
-def clear_backtest_history(strategy_name):
-    """Clears all previous backtest data for a given strategy and the logs."""
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        logging.info(f"Clearing backtest history for strategy: {strategy_name}")
-        # Execute each DROP statement from the SQL file
-        drop_statements = load_sql_query("clear_backtest_tables.sql").split(';')
-        for statement in drop_statements:
-            if statement.strip():
-                conn.execute(statement)
-        conn.commit()
-        logging.info("Successfully cleared backtest history and logs.")
-    except Exception as e:
-        # Use print because logger might not be configured yet or is being cleared
-        print(f"Error clearing backtest history: {e}")
-    finally:
-        conn.close()
+def setup_logging():
+    """Configure logging to use the DatabaseLogHandler."""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    # Clear any existing handlers
+    logger.handlers = []
+    db_handler = DatabaseLogHandler(db)
+    logger.addHandler(db_handler)
+    return logger
 
 def run_backtest():
     """Run the portfolio backtest"""
@@ -436,7 +157,6 @@ def run_backtest():
     
     # Add our strategy
     cerebro.addstrategy(PortfolioStrategy)
-    # cerebro.addstrategy(BracketStrategy)
     
     # Get portfolio data
     portfolio_df = get_portfolio_data()
@@ -445,11 +165,10 @@ def run_backtest():
     for symbol in get_sp500_tickers():  # Changed to use sp500_tickers instead of portfolio
         try:
             # Get historical data from SQLite
-            con = sqlite3.connect(DB_FILE)
-            query = load_sql_query("get_backtest_historical_data.sql")
+            query = db.load_sql_query("get_backtest_historical_data.sql")
             df = pd.read_sql_query(
                 query,
-                con,
+                db.get_connection(),
                 params=[symbol, START_DATE, END_DATE],
                 parse_dates={'date': '%Y-%m-%d %H:%M:%S'}
             )
@@ -478,8 +197,6 @@ def run_backtest():
         except Exception as e:
             logger.error(f"Error adding data feed for {symbol}: {e}")
             continue
-        finally:
-            con.close()
     
     # Set our desired cash start
     cerebro.broker.setcash(INITIAL_CASH)
