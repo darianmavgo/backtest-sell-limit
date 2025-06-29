@@ -35,7 +35,7 @@ const (
 	tokenFile   = ".credentials/token.json"
 	dbFile      = "backtest_sell_limits.db"
 	targetLabel = "backteststoxx"
-	serverPort  = ":8080"
+	serverPort  = "8080"
 )
 
 // result represents the result of processing an email
