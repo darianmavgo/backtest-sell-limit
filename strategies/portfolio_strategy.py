@@ -71,6 +71,81 @@ class PortfolioStrategy(bt.Strategy):
         else: # Submitted, Accepted, Partial
             logging.info(message, extra=extra_data)
 
+    def notify_trade(self, trade):
+        """Log trade notifications to the database."""
+        if trade.isclosed:
+            # Calculate PnL percentage
+            pnl_percent = (trade.pnl / abs(trade.price)) * 100 if trade.price != 0 else 0
+            
+            # Import here to avoid circular imports
+            from portfolio_backtest import db
+            
+            # Ensure the table exists
+            db.execute_sql_file("create_strategy_history_table.sql")
+            
+            # Log the trade
+            db.execute_sql_file("insert_strategy_history.sql", (
+                "PortfolioStrategy_20_percent_sell_limit",  # strategy_name
+                trade.data._name,  # symbol
+                "LONG" if trade.size > 0 else "SHORT",  # trade_type
+                "CLOSE",  # trade_status
+                abs(trade.size),  # size
+                trade.price,  # price
+                abs(trade.value),  # value
+                trade.pnl,  # pnl
+                pnl_percent,  # pnl_percent
+                trade.commission,  # commission
+            ))
+            db.commit()
+            
+            # Log trade details
+            logging.info(
+                f"Trade Closed: {trade.data._name} - PnL: ${trade.pnl:.2f} ({pnl_percent:.2f}%)",
+                extra={
+                    'symbol': trade.data._name,
+                    'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                    'size': abs(trade.size),
+                    'price': trade.price,
+                    'value': abs(trade.value),
+                    'pnl': trade.pnl,
+                    'pnl_percent': pnl_percent,
+                    'commission': trade.commission
+                }
+            )
+        elif trade.isopen:
+            # Log trade opening
+            from portfolio_backtest import db
+            
+            # Ensure the table exists
+            db.execute_sql_file("create_strategy_history_table.sql")
+            
+            # Log the trade
+            db.execute_sql_file("insert_strategy_history.sql", (
+                "PortfolioStrategy_20_percent_sell_limit",  # strategy_name
+                trade.data._name,  # symbol
+                "LONG" if trade.size > 0 else "SHORT",  # trade_type
+                "OPEN",  # trade_status
+                abs(trade.size),  # size
+                trade.price,  # price
+                abs(trade.value),  # value
+                0,  # pnl (not realized yet)
+                0,  # pnl_percent (not realized yet)
+                trade.commission,  # commission
+            ))
+            db.commit()
+            
+            logging.info(
+                f"Trade Opened: {trade.data._name} - Size: {abs(trade.size)} @ ${trade.price:.2f}",
+                extra={
+                    'symbol': trade.data._name,
+                    'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                    'size': abs(trade.size),
+                    'price': trade.price,
+                    'value': abs(trade.value),
+                    'commission': trade.commission
+                }
+            )
+
     def stop(self):
         # Calculate return
         final_value = self.broker.getvalue()

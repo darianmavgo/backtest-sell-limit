@@ -5,6 +5,8 @@ go 1.23.0
 toolchain go1.23.10
 
 require (
+	github.com/go-chi/chi/v5 v5.0.12
+	github.com/gomarkdown/markdown v0.0.0-20250311123330-531bef5e742b
 	github.com/mattn/go-sqlite3 v1.14.28
 	golang.org/x/net v0.41.0
 	golang.org/x/oauth2 v0.30.0
@@ -18,7 +20,6 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/gomarkdown/markdown v0.0.0-20250311123330-531bef5e742b // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect

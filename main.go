@@ -11,9 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +19,8 @@ import (
 
 	"crypto/tls"
 
-	"github.com/gomarkdown/markdown"
-	mdhtml "github.com/gomarkdown/markdown/html"
-	"github.com/gomarkdown/markdown/parser"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
 	"golang.org/x/oauth2"
@@ -47,22 +44,26 @@ type result struct {
 	err error
 }
 
-// StockData represents stock information for a ticker
+// StockData represents stock information from the database
 type StockData struct {
 	Symbol           string    `json:"symbol"`
-	CompanyName      string    `json:"companyName"`
+	CompanyName      string    `json:"company_name"`
 	Price            float64   `json:"price"`
-	Change           float64   `json:"change"`
-	ChangePercent    float64   `json:"changePercent"`
+	ChangeAmount     float64   `json:"change_amount"`
+	ChangePercent    float64   `json:"change_percent"`
 	Volume           int64     `json:"volume"`
-	MarketCap        int64     `json:"marketCap"`
-	PreviousClose    float64   `json:"previousClose"`
-	Open             float64   `json:"open"`
+	MarketCap        int64     `json:"market_cap"`
+	PreviousClose    float64   `json:"previous_close"`
+	OpenPrice        float64   `json:"open_price"`
 	High             float64   `json:"high"`
 	Low              float64   `json:"low"`
-	FiftyTwoWeekHigh float64   `json:"fiftyTwoWeekHigh"`
-	FiftyTwoWeekLow  float64   `json:"fiftyTwoWeekLow"`
-	LastUpdated      time.Time `json:"lastUpdated"`
+	FiftyTwoWeekHigh float64   `json:"fifty_two_week_high"`
+	FiftyTwoWeekLow  float64   `json:"fifty_two_week_low"`
+	LastUpdated      int64     `json:"last_updated"`
+	Date             time.Time `json:"date"`
+	Open             float64   `json:"open"`
+	Close            float64   `json:"close"`
+	AdjClose         float64   `json:"adj_close"`
 }
 
 // StockResult represents the result of fetching stock data
@@ -355,10 +356,11 @@ func (db *DB) saveEmailToDB(msg *gmail.Message) error {
 	return nil
 }
 
+// HandlerResponse represents a standardized API response
 type HandlerResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Error   string `json:"error,omitempty"`
+	Success bool        `json:"success"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 // OAuth configuration
@@ -373,40 +375,294 @@ type SP500Stock struct {
 	SecurityName string `json:"security_name"`
 }
 
-func main() {
-	// Initialize the database
-	db, err := initDB()
+// StreamingLogWriter is a writer that streams logs to an HTTP response
+type StreamingLogWriter struct {
+	w  http.ResponseWriter
+	f  http.Flusher
+	mu sync.Mutex
+}
+
+func NewStreamingLogWriter(w http.ResponseWriter) *StreamingLogWriter {
+	f, _ := w.(http.Flusher)
+	return &StreamingLogWriter{
+		w: w,
+		f: f,
+	}
+}
+
+func (s *StreamingLogWriter) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Write the log line
+	n, err = s.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	// Flush if we have a flusher
+	if s.f != nil {
+		s.f.Flush()
+	}
+
+	return n, nil
+}
+
+// portfolioBacktestHandler runs the portfolio backtest and streams the output
+func portfolioBacktestHandler(w http.ResponseWriter, r *http.Request) {
+	// Get list of active tickers
+	tickers, err := getActiveSP500Tickers(db)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get tickers: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Process each ticker
+	for _, symbol := range tickers {
+		// Get historical data
+		data, err := fetchHistoricalData(symbol)
+		if err != nil {
+			log.Printf("Failed to fetch historical data for %s: %v", symbol, err)
+			continue
+		}
+
+		// Save to database
+		if err := saveHistoricalData(db, symbol, data); err != nil {
+			log.Printf("Failed to save historical data for %s: %v", symbol, err)
+			continue
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "completed",
+	})
+}
+
+// Global database connection
+var db *sql.DB
+
+func init() {
+	// Initialize database
+	var err error
+	db, err = sql.Open("sqlite3", dbFile+"?_journal_mode=WAL")
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close()
 
-	dbWrapper := NewDB(db)
+	// Set connection pool settings
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Set up routes
-	http.HandleFunc("/", handleHome)
-	http.HandleFunc("/login", handleGoogleLogin)
-	http.HandleFunc("/callback", handleGoogleCallback)
-	http.HandleFunc("/readme", readmeHandler)
-	http.HandleFunc("/batchget", func(w http.ResponseWriter, r *http.Request) {
-		batchGetHandler(w, r, dbWrapper)
+	// Create tables
+	if err := createTables(db); err != nil {
+		log.Fatalf("Failed to create tables: %v", err)
+	}
+}
+
+func createTables(db *sql.DB) error {
+	// Create the emails table with the new schema
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS emails (
+			id TEXT PRIMARY KEY,
+			thread_id TEXT,
+			subject TEXT,
+			from_address TEXT,
+			to_address TEXT,
+			date INTEGER,
+			plain_text TEXT,
+			html TEXT,
+			label_ids TEXT,
+			UNIQUE(id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create emails table: %v", err)
+	}
+
+	// Create the stock_data table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stock_data (
+			symbol TEXT PRIMARY KEY,
+			company_name TEXT,
+			price REAL,
+			change_amount REAL,
+			change_percent REAL,
+			volume INTEGER,
+			market_cap INTEGER,
+			previous_close REAL,
+			open_price REAL,
+			high REAL,
+			low REAL,
+			fifty_two_week_high REAL,
+			fifty_two_week_low REAL,
+			last_updated INTEGER,
+			UNIQUE(symbol)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create stock_data table: %v", err)
+	}
+
+	// Create the stock_historical_data table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS stock_historical_data (
+			symbol TEXT,
+			date INTEGER,
+			open REAL,
+			high REAL,
+			low REAL,
+			close REAL,
+			adj_close REAL,
+			volume INTEGER,
+			PRIMARY KEY (symbol, date)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create stock_historical_data table: %v", err)
+	}
+
+	// Create indexes
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_thread_id ON emails(thread_id);
+		CREATE INDEX IF NOT EXISTS idx_date ON emails(date);
+		CREATE INDEX IF NOT EXISTS idx_subject ON emails(subject);
+		CREATE INDEX IF NOT EXISTS idx_stock_symbol ON stock_data(symbol);
+		CREATE INDEX IF NOT EXISTS idx_stock_updated ON stock_data(last_updated);
+		CREATE INDEX IF NOT EXISTS idx_stock_change_percent ON stock_data(change_percent);
+		CREATE INDEX IF NOT EXISTS idx_historical_symbol_date ON stock_historical_data(symbol, date);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create indexes: %v", err)
+	}
+
+	return nil
+}
+
+func main() {
+	// Create router
+	r := chi.NewRouter()
+
+	// Middleware
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+
+	// Routes
+	r.Get("/api/stock/{symbol}", stockHandler)
+	r.Get("/api/stock/historical/{symbol}", historicalDataHandler)
+	r.Get("/api/stock/historical/fill", fillHistoricalDataHandler)
+	r.Get("/api/portfolio/backtest", portfolioBacktestHandler)
+
+	// Database browsing routes
+	r.Get("/api/tables", func(w http.ResponseWriter, r *http.Request) {
+		// Query to get all table names
+		rows, err := db.Query(`
+			SELECT name FROM sqlite_master 
+			WHERE type='table' AND name NOT LIKE 'sqlite_%'
+			ORDER BY name
+		`)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get tables: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var tables []string
+		for rows.Next() {
+			var tableName string
+			if err := rows.Scan(&tableName); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to scan table name: %v", err), http.StatusInternalServerError)
+				return
+			}
+			tables = append(tables, tableName)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tables)
 	})
-	http.HandleFunc("/fixdate", func(w http.ResponseWriter, r *http.Request) {
-		fixDateHandler(w, r, dbWrapper)
-	})
-	http.HandleFunc("/api/sp500/update", func(w http.ResponseWriter, r *http.Request) {
-		updateSP500Handler(w, r, dbWrapper)
-	})
-	http.HandleFunc("/api/sp500/list", func(w http.ResponseWriter, r *http.Request) {
-		listSP500Handler(w, r, dbWrapper)
-	})
-	http.HandleFunc("/api/stock/historical/fill", func(w http.ResponseWriter, r *http.Request) {
-		historicalDataHandler(w, r, dbWrapper)
+
+	r.Get("/api/tables/{table}", func(w http.ResponseWriter, r *http.Request) {
+		tableName := chi.URLParam(r, "table")
+		page := r.URL.Query().Get("page")
+		pageSize := r.URL.Query().Get("pageSize")
+
+		if page == "" {
+			page = "1"
+		}
+		if pageSize == "" {
+			pageSize = "100"
+		}
+
+		pageNum, _ := strconv.Atoi(page)
+		pageSizeNum, _ := strconv.Atoi(pageSize)
+		offset := (pageNum - 1) * pageSizeNum
+
+		// Validate table name exists
+		var exists bool
+		err := db.QueryRow(`
+			SELECT 1 FROM sqlite_master 
+			WHERE type='table' AND name=? AND name NOT LIKE 'sqlite_%'
+		`, tableName).Scan(&exists)
+		if err != nil || !exists {
+			http.Error(w, "Table not found", http.StatusNotFound)
+			return
+		}
+
+		// Execute the query
+		rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d", tableName, pageSizeNum, offset))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to query table: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		// Get column names
+		columns, err := rows.Columns()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get columns: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Prepare result
+		var result []map[string]interface{}
+		for rows.Next() {
+			// Create a slice of interface{} to hold the values
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			// Scan the result into the values
+			if err := rows.Scan(valuePtrs...); err != nil {
+				http.Error(w, fmt.Sprintf("Failed to scan row: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Create a map for this row
+			row := make(map[string]interface{})
+			for i, col := range columns {
+				var v interface{}
+				val := values[i]
+				b, ok := val.([]byte)
+				if ok {
+					v = string(b)
+				} else {
+					v = val
+				}
+				row[col] = v
+			}
+			result = append(result, row)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 	})
 
 	// Start the server
 	fmt.Printf("Server is running on port %s\n", serverPort)
-	log.Fatal(http.ListenAndServe(serverPort, nil))
+	log.Fatal(http.ListenAndServe(":"+serverPort, r))
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
@@ -469,34 +725,214 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 
 func handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 	url := config.AuthCodeURL(oauthStateString)
-	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: "Authorization URL generated",
+		Data:    url,
+	})
 }
 
 func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
-	state := r.FormValue("state")
+	state := r.URL.Query().Get("state")
 	if state != oauthStateString {
-		fmt.Printf("Invalid oauth state, expected '%s', got '%s'\n", oauthStateString, state)
-		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: "Invalid OAuth state",
+			Data:    nil,
+		})
 		return
 	}
 
-	code := r.FormValue("code")
+	code := r.URL.Query().Get("code")
 	token, err := config.Exchange(context.Background(), code)
 	if err != nil {
-		fmt.Printf("Code exchange failed with '%s'\n", err)
-		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to exchange token: %v", err),
+			Data:    nil,
+		})
 		return
 	}
 
-	// Save the token
-	if err := saveToken(tokenFile, token); err != nil {
-		log.Printf("Unable to save token: %v", err)
-		http.Error(w, "Failed to save authentication token", http.StatusInternalServerError)
+	client := config.Client(context.Background(), token)
+	srv, err := gmail.NewService(context.Background(), option.WithHTTPClient(client))
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to create Gmail client: %v", err),
+			Data:    nil,
+		})
 		return
 	}
 
-	// Redirect to home page with success message
-	http.Redirect(w, r, "/?success=true", http.StatusTemporaryRedirect)
+	// Get user profile
+	user, err := srv.Users.GetProfile("me").Do()
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get user profile: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: "Successfully authenticated",
+		Data: map[string]interface{}{
+			"email": user.EmailAddress,
+			"token": token,
+		},
+	})
+}
+
+func batchGetHandler(w http.ResponseWriter, r *http.Request) {
+	labelName := r.URL.Query().Get("label")
+	if labelName == "" {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: "Label name is required",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Get Gmail service
+	ctx := context.Background()
+	client, err := getGmailClient(ctx)
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get Gmail client: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	srv, err := gmail.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to create Gmail service: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	// Get label ID
+	labelID, err := getLabelID(srv, labelName)
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get label ID: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	// Get messages
+	messages, err := getMessagesWithLabel(srv, labelID)
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get messages: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: fmt.Sprintf("Successfully retrieved %d messages", len(messages)),
+		Data:    messages,
+	})
+}
+
+func fixDateHandler(w http.ResponseWriter, r *http.Request, db *DB) {
+	rows, err := db.Query("SELECT id, date FROM emails")
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to query emails: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+	defer rows.Close()
+
+	var updates int
+	for rows.Next() {
+		var id string
+		var dateStr string
+		if err := rows.Scan(&id, &dateStr); err != nil {
+			sendJSONResponse(w, HandlerResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to scan row: %v", err),
+				Data:    nil,
+			})
+			return
+		}
+
+		// Parse and fix date
+		date, err := time.Parse(time.RFC3339, dateStr)
+		if err != nil {
+			continue
+		}
+
+		// Update the record
+		_, err = db.Exec("UPDATE emails SET date = ? WHERE id = ?", date.Unix(), id)
+		if err != nil {
+			continue
+		}
+		updates++
+	}
+
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: fmt.Sprintf("Successfully updated %d dates", updates),
+		Data:    updates,
+	})
+}
+
+func sp500Handler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: "Method not allowed",
+			Data:    nil,
+		})
+		return
+	}
+
+	stocks, err := fetchSP500List()
+	if err != nil {
+		sendJSONResponse(w, HandlerResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to fetch S&P 500 list: %v", err),
+			Data:    nil,
+		})
+		return
+	}
+
+	// Update each stock's data
+	for _, stock := range stocks {
+		data, err := fetchHistoricalData(stock.Symbol)
+		if err != nil {
+			log.Printf("Failed to fetch historical data for %s: %v", stock.Symbol, err)
+			continue
+		}
+
+		if err := saveHistoricalData(db, stock.Symbol, data); err != nil {
+			log.Printf("Failed to save historical data for %s: %v", stock.Symbol, err)
+			continue
+		}
+	}
+
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: fmt.Sprintf("Successfully updated %d S&P 500 stocks", len(stocks)),
+		Data:    stocks,
+	})
 }
 
 // Update getGmailClient to use the stored token
@@ -509,437 +945,14 @@ func getGmailClient(ctx context.Context) (*http.Client, error) {
 	return config.Client(ctx, token), nil
 }
 
-func batchGetHandler(w http.ResponseWriter, r *http.Request, db *DB) {
-	// Get Gmail service
-	ctx := context.Background()
-	client, err := getGmailClient(ctx)
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to get Gmail client: %v", err),
-		})
-		return
-	}
-
-	srv, err := gmail.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to create Gmail service: %v", err),
-		})
-		return
-	}
-
-	// Get label ID
-	labelID, err := getLabelID(srv, targetLabel)
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to get label ID: %v", err),
-		})
-		return
-	}
-
-	// Fetch emails
-	if err := fetchEmailsWithLabel(srv, labelID, db); err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to fetch emails: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, HandlerResponse{
-		Success: true,
-		Message: "Successfully fetched and stored emails",
-	})
-}
-
-func fixDateHandler(w http.ResponseWriter, r *http.Request, db *DB) {
-	// Get Gmail service
-	ctx := context.Background()
-	client, err := getGmailClient(ctx)
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to get Gmail client: %v", err),
-		})
-		return
-	}
-
-	srv, err := gmail.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to create Gmail service: %v", err),
-		})
-		return
-	}
-
-	// Update dates
-	if err := updateEmailDates(srv, db); err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to update email dates: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, HandlerResponse{
-		Success: true,
-		Message: "Successfully updated email dates",
-	})
-}
-
-func updateEmailDates(srv *gmail.Service, db *DB) error {
-	// Get all message IDs from the database
-	rows, err := db.Query("SELECT id FROM emails")
-	if err != nil {
-		return fmt.Errorf("failed to query emails: %v", err)
-	}
-	defer rows.Close()
-
-	var messageIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return fmt.Errorf("failed to scan message ID: %v", err)
-		}
-		messageIDs = append(messageIDs, id)
-	}
-
-	// Create a worker pool to process messages
-	numWorkers := 10
-	jobs := make(chan string, len(messageIDs))
-	results := make(chan error, len(messageIDs))
-
-	// Start workers
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for messageID := range jobs {
-				msg, err := srv.Users.Messages.Get("me", messageID).Do()
-				if err != nil {
-					results <- fmt.Errorf("failed to get message %s: %v", messageID, err)
-					continue
-				}
-
-				// Update the date in the database using internalDate
-				_, err = db.Exec("UPDATE emails SET date = ? WHERE id = ?", msg.InternalDate, messageID)
-				if err != nil {
-					results <- fmt.Errorf("failed to update date for message %s: %v", messageID, err)
-					continue
-				}
-
-				results <- nil
-			}
-		}()
-	}
-
-	// Send jobs to workers
-	for _, messageID := range messageIDs {
-		jobs <- messageID
-	}
-	close(jobs)
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Process results
-	var errors []error
-	var processedCount int
-	for err := range results {
-		if err != nil {
-			errors = append(errors, err)
-		} else {
-			processedCount++
-		}
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf("encountered %d errors while updating dates: %v", len(errors), errors[0])
-	}
-
-	log.Printf("Successfully updated dates for %d messages", processedCount)
-	return nil
-}
-
-func sendJSONResponse(w http.ResponseWriter, response HandlerResponse) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Error encoding response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
-}
-
-// extractPortFromRedirectURI extracts the port number from a redirect URI
-func extractPortFromRedirectURI(uri string) (int, error) {
-	u, err := url.Parse(uri)
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse URI: %v", err)
-	}
-
-	if u.Port() == "" {
-		return 0, fmt.Errorf("no port specified in URI")
-	}
-
-	port, err := strconv.Atoi(u.Port())
-	if err != nil {
-		return 0, fmt.Errorf("invalid port number: %v", err)
-	}
-
-	return port, nil
-}
-
-// getTokenFromWeb requests a token from the web, then returns the retrieved token.
-func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("Go to the following link in your browser:\n%v\n", authURL)
-
-	fmt.Print("Enter the authorization code: ")
-	var authCode string
-	if _, err := fmt.Scan(&authCode); err != nil {
-		return nil, fmt.Errorf("unable to read authorization code: %v", err)
-	}
-
-	tok, err := config.Exchange(context.Background(), authCode)
-	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve token from web: %v", err)
-	}
-	return tok, nil
-}
-
-// tokenFromFile retrieves a token from a local file.
-func tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-	return tok, err
-}
-
-// saveToken saves a token to a file path.
-func saveToken(path string, token *oauth2.Token) error {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("unable to cache oauth token: %v", err)
-	}
-	defer f.Close()
-	return json.NewEncoder(f).Encode(token)
-}
-
-// sanitizeFilename makes a string safe to use as a filename
-func sanitizeFilename(name string) string {
-	// Replace invalid characters with underscores
-	invalid := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-	name = invalid.ReplaceAllString(name, "_")
-
-	// Limit length
-	if len(name) > 200 {
-		name = name[:200]
-	}
-
-	return name
-}
-
-// fetchEmailsWithLabel retrieves all emails with the specified label
-func fetchEmailsWithLabel(srv *gmail.Service, labelID string, db *DB) error {
-	messages, err := srv.Users.Messages.List("me").LabelIds(labelID).Do()
-	if err != nil {
-		return fmt.Errorf("unable to retrieve messages: %v", err)
-	}
-
-	if len(messages.Messages) == 0 {
-		return fmt.Errorf("no messages found with label")
-	}
-
-	// Create channels for concurrent processing
-	numWorkers := 10
-	jobs := make(chan *gmail.Message, len(messages.Messages))
-	results := make(chan result, len(messages.Messages))
-
-	// Start worker pool
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for msg := range jobs {
-				message, err := srv.Users.Messages.Get("me", msg.Id).Do()
-				if err != nil {
-					results <- result{err: fmt.Errorf("failed to get message %s: %v", msg.Id, err)}
-					continue
-				}
-
-				// Save directly to database using our DB type
-				if err := db.saveEmailToDB(message); err != nil {
-					results <- result{err: fmt.Errorf("failed to save message %s: %v", msg.Id, err)}
-					continue
-				}
-
-				results <- result{msg: message}
-			}
-		}()
-	}
-
-	// Send jobs to workers
-	for _, msg := range messages.Messages {
-		jobs <- msg
-	}
-	close(jobs)
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Process results
-	var errors []error
-	var processedCount int
-	for result := range results {
-		if result.err != nil {
-			errors = append(errors, result.err)
-		} else {
-			processedCount++
-		}
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf("encountered %d errors while processing messages: %v", len(errors), errors[0])
-	}
-
-	log.Printf("Successfully processed %d messages", processedCount)
-	return nil
-}
-
-// parseDate attempts to parse a date string using multiple formats
-func parseDate(dateStr string) (time.Time, error) {
-	// Common email date formats
-	formats := []string{
-		"Mon, 2 Jan 2006 15:04:05 -0700",
-		"Mon, 02 Jan 2006 15:04:05 -0700",
-		"2 Jan 2006 15:04:05 -0700",
-		"02 Jan 2006 15:04:05 -0700",
-		"Mon, 2 Jan 2006 15:04:05 MST",
-		"Mon, 02 Jan 2006 15:04:05 MST",
-		time.RFC1123Z,
-		time.RFC822Z,
-		time.RFC3339,
-		"Mon, 2 Jan 2006 15:04:05 GMT",
-		"Mon, 02 Jan 2006 15:04:05 GMT",
-		"2006-01-02T15:04:05Z",
-		"2006-01-02 15:04:05",
-	}
-
-	for _, format := range formats {
-		if t, err := time.Parse(format, dateStr); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("could not parse date: %s", dateStr)
-}
-
-// extractDateFromHTML attempts to find a date in the HTML content
-func extractDateFromHTML(htmlContent string) (time.Time, error) {
-	doc, err := html.Parse(strings.NewReader(htmlContent))
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	// Common date patterns in HTML
-	datePatterns := []string{
-		`\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?(?:\s+[+-]\d{4})?`,
-		`\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?`,
-		`\d{1,2}/\d{1,2}/\d{4}`,
-	}
-
-	var dates []string
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			text := strings.TrimSpace(n.Data)
-			for _, pattern := range datePatterns {
-				re := regexp.MustCompile(pattern)
-				if match := re.FindString(text); match != "" {
-					dates = append(dates, match)
-				}
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
-	}
-	f(doc)
-
-	// Try to parse each found date
-	for _, dateStr := range dates {
-		if t, err := parseDate(dateStr); err == nil {
-			return t, nil
-		}
-	}
-
-	return time.Time{}, fmt.Errorf("no valid date found in HTML")
-}
-
-// Process headers and extract date in fetchEmailsWithLabel function
-func processEmailDate(email *gmail.Message, headers []*gmail.MessagePartHeader, htmlContent string) {
-	var dateStr string
-	for _, header := range headers {
-		if header.Name == "Date" {
-			dateStr = header.Value
-			break
-		}
-	}
-
-	// Try to parse the date from header
-	if dateStr != "" {
-		if parsedDate, err := parseDate(dateStr); err == nil {
-			email.InternalDate = parsedDate.Unix()
-			return
-		}
-	}
-
-	// If header date parsing failed, try HTML content
-	if htmlContent != "" {
-		if parsedDate, err := extractDateFromHTML(htmlContent); err == nil {
-			email.InternalDate = parsedDate.Unix()
-			return
-		}
-	}
-
-	// If all else fails, use current time and log warning
-	email.InternalDate = time.Now().Unix()
-	log.Printf("Warning: Could not parse date for message %s, using current time", email.Id)
-}
-
-// Modify the email processing part in fetchEmailsWithLabel
-func extractMessageContent(message *gmail.Message) error {
-	// Process the date with both header and HTML content
-	var htmlContent string
-	if message.Payload != nil && message.Payload.Body != nil {
-		htmlContent = message.Payload.Body.Data
-	}
-	processEmailDate(message, message.Payload.Headers, htmlContent)
-	return nil
-}
-
 func getLabelID(srv *gmail.Service, labelName string) (string, error) {
 	labels, err := srv.Users.Labels.List("me").Do()
 	if err != nil {
-		return "", fmt.Errorf("unable to retrieve labels: %v", err)
+		return "", fmt.Errorf("failed to list labels: %v", err)
 	}
 
 	for _, label := range labels.Labels {
-		if label.Name == labelName {
+		if strings.EqualFold(label.Name, labelName) {
 			return label.Id, nil
 		}
 	}
@@ -947,97 +960,25 @@ func getLabelID(srv *gmail.Service, labelName string) (string, error) {
 	return "", fmt.Errorf("label '%s' not found", labelName)
 }
 
-func createTables(db *sql.DB) error {
-	// Create the emails table with the new schema
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS emails (
-			id TEXT PRIMARY KEY,
-			thread_id TEXT,
-			subject TEXT,
-			from_address TEXT,
-			to_address TEXT,
-			date INTEGER,
-			plain_text TEXT,
-			html TEXT,
-			label_ids TEXT,
-			UNIQUE(id)
-		)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create table: %v", err)
+func getMessagesWithLabel(srv *gmail.Service, labelID string) ([]*gmail.Message, error) {
+	var messages []*gmail.Message
+	pageToken := ""
+	for {
+		req := srv.Users.Messages.List("me").LabelIds(labelID)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
+		r, err := req.Do()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list messages: %v", err)
+		}
+		messages = append(messages, r.Messages...)
+		if r.NextPageToken == "" {
+			break
+		}
+		pageToken = r.NextPageToken
 	}
-
-	// Create the stock_data table for S&P 500 tickers
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS stock_data (
-			symbol TEXT PRIMARY KEY,
-			company_name TEXT,
-			price REAL,
-			change_amount REAL,
-			change_percent REAL,
-			volume INTEGER,
-			market_cap INTEGER,
-			previous_close REAL,
-			open_price REAL,
-			high REAL,
-			low REAL,
-			fifty_two_week_high REAL,
-			fifty_two_week_low REAL,
-			last_updated INTEGER,
-			UNIQUE(symbol)
-		)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create stock_data table: %v", err)
-	}
-
-	// Create the stock_historical_data table
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS stock_historical_data (
-			symbol TEXT,
-			date INTEGER,
-			open REAL,
-			high REAL,
-			low REAL,
-			close REAL,
-			adj_close REAL,
-			volume INTEGER,
-			PRIMARY KEY (symbol, date)
-		)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create stock_historical_data table: %v", err)
-	}
-
-	// Create indexes for emails
-	_, err = db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_thread_id ON emails(thread_id);
-		CREATE INDEX IF NOT EXISTS idx_date ON emails(date);
-		CREATE INDEX IF NOT EXISTS idx_subject ON emails(subject);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create indexes: %v", err)
-	}
-
-	// Create indexes for stock_data
-	_, err = db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_stock_symbol ON stock_data(symbol);
-		CREATE INDEX IF NOT EXISTS idx_stock_updated ON stock_data(last_updated);
-		CREATE INDEX IF NOT EXISTS idx_stock_change_percent ON stock_data(change_percent);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create stock indexes: %v", err)
-	}
-
-	// Create indexes for stock_historical_data
-	_, err = db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_historical_symbol_date ON stock_historical_data(symbol, date);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create historical stock indexes: %v", err)
-	}
-
-	return nil
+	return messages, nil
 }
 
 func processEmail(message *gmail.Message) (*gmail.Message, error) {
@@ -1152,17 +1093,21 @@ func fetchStockData(ticker string) (*StockData, error) {
 		Symbol:           ticker,
 		CompanyName:      meta.LongName,
 		Price:            currentPrice,
-		Change:           change,
+		ChangeAmount:     change,
 		ChangePercent:    changePercent,
 		Volume:           meta.RegularMarketVolume,
 		MarketCap:        meta.MarketCap,
 		PreviousClose:    previousClose,
-		Open:             meta.RegularMarketOpen,
+		OpenPrice:        meta.RegularMarketOpen,
 		High:             meta.RegularMarketDayHigh,
 		Low:              meta.RegularMarketDayLow,
 		FiftyTwoWeekHigh: meta.FiftyTwoWeekHigh,
 		FiftyTwoWeekLow:  meta.FiftyTwoWeekLow,
-		LastUpdated:      time.Now(),
+		LastUpdated:      int64(meta.RegularMarketPrice),
+		Date:             time.Now(),
+		Open:             meta.RegularMarketOpen,
+		Close:            currentPrice,
+		AdjClose:         currentPrice,
 	}, nil
 }
 
@@ -1184,17 +1129,17 @@ func (db *DB) saveStockData(stock *StockData) error {
 		stock.Symbol,
 		stock.CompanyName,
 		stock.Price,
-		stock.Change,
+		stock.ChangeAmount,
 		stock.ChangePercent,
 		stock.Volume,
 		stock.MarketCap,
 		stock.PreviousClose,
-		stock.Open,
+		stock.OpenPrice,
 		stock.High,
 		stock.Low,
 		stock.FiftyTwoWeekHigh,
 		stock.FiftyTwoWeekLow,
-		stock.LastUpdated.Unix(),
+		stock.LastUpdated,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert stock data: %v", err)
@@ -1203,319 +1148,78 @@ func (db *DB) saveStockData(stock *StockData) error {
 	return nil
 }
 
-// fetchAllSP500Data fetches data for all S&P 500 tickers using goroutines
-func fetchAllSP500Data(db *DB) error {
-	// Get ticker list from database
-	tickers, err := db.getActiveSP500Tickers()
+// fetchAllSP500Data fetches data for all S&P 500 stocks
+func fetchAllSP500Data() error {
+	// Get list of active tickers
+	tickers, err := getActiveSP500Tickers(db)
 	if err != nil {
-		return fmt.Errorf("failed to get ticker list: %v", err)
+		return fmt.Errorf("failed to get tickers: %v", err)
 	}
 
-	if len(tickers) == 0 {
-		return fmt.Errorf("no active tickers found in database")
-	}
-
-	numWorkers := 20 // Concurrent goroutines
-	jobs := make(chan string, len(tickers))
-	results := make(chan StockResult, len(tickers))
-
-	// Start worker pool
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ticker := range jobs {
-				stockData, err := fetchStockData(ticker)
-				if err != nil {
-					results <- StockResult{Err: fmt.Errorf("failed to fetch %s: %v", ticker, err)}
-					continue
-				}
-
-				// Save to database
-				if err := db.saveStockData(stockData); err != nil {
-					results <- StockResult{Err: fmt.Errorf("failed to save %s: %v", ticker, err)}
-					continue
-				}
-
-				results <- StockResult{Data: stockData}
-			}
-		}()
-	}
-
-	// Send jobs to workers
-	for _, ticker := range tickers {
-		jobs <- ticker
-	}
-	close(jobs)
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Process results
-	var errors []error
-	var successCount int
-	for result := range results {
-		if result.Err != nil {
-			errors = append(errors, result.Err)
-		} else {
-			successCount++
+	// Process each ticker
+	for _, symbol := range tickers {
+		// Get historical data
+		data, err := fetchHistoricalData(symbol)
+		if err != nil {
+			log.Printf("Failed to fetch historical data for %s: %v", symbol, err)
+			continue
 		}
-	}
 
-	log.Printf("Successfully fetched and saved data for %d out of %d S&P 500 tickers", successCount, len(tickers))
-
-	if len(errors) > 0 {
-		log.Printf("Encountered %d errors while fetching stock data", len(errors))
-		// Log first few errors
-		for i, err := range errors {
-			if i >= 5 { // Only log first 5 errors
-				break
-			}
-			log.Printf("Error %d: %v", i+1, err)
+		// Save to database
+		if err := saveHistoricalData(db, symbol, data); err != nil {
+			log.Printf("Failed to save historical data for %s: %v", symbol, err)
+			continue
 		}
 	}
 
 	return nil
 }
 
-// sp500Handler handles the S&P 500 data fetching endpoint
-func sp500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
-	log.Printf("Starting S&P 500 data fetch...")
-
-	start := time.Now()
-	if err := fetchAllSP500Data(db); err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to fetch S&P 500 data: %v", err),
-		})
+// historicalDataHandler handles requests for historical stock data
+func historicalDataHandler(w http.ResponseWriter, r *http.Request) {
+	symbol := chi.URLParam(r, "symbol")
+	if symbol == "" {
+		http.Error(w, "Symbol is required", http.StatusBadRequest)
 		return
 	}
 
-	duration := time.Since(start)
-	message := fmt.Sprintf("Successfully fetched S&P 500 data in %v", duration)
-	log.Printf(message)
-
-	sendJSONResponse(w, HandlerResponse{
-		Success: true,
-		Message: message,
-	})
-}
-
-// historicalDataHandler handles the historical data fetching endpoint
-func historicalDataHandler(w http.ResponseWriter, r *http.Request, db *DB) {
-	if r.Method != http.MethodGet {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   "Method not allowed",
-		})
-		return
-	}
-
-	// Parse query parameters
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	symbol := r.URL.Query().Get("symbol")
-
-	if startDateStr == "" || endDateStr == "" {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   "Missing required query parameters: start_date, end_date",
-		})
-		return
-	}
-
-	// Parse dates
-	layout := "2006-01-02"
-	startDate, err := time.Parse(layout, startDateStr)
+	// Query the database for historical data
+	rows, err := db.Query(`
+		SELECT date, open, high, low, close, adj_close, volume
+		FROM stock_historical_data 
+		WHERE symbol = ?
+		ORDER BY date DESC
+	`, symbol)
 	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Invalid start_date format: %v", err),
-		})
+		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
 		return
 	}
-	endDate, err := time.Parse(layout, endDateStr)
-	if err != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Invalid end_date format: %v", err),
-		})
-		return
-	}
+	defer rows.Close()
 
-	log.Printf("Starting historical data fetch from %s to %s...", startDateStr, endDateStr)
-	start := time.Now()
-
-	var fetchErr error
-	if symbol != "" {
-		// Fetch data for a single symbol
-		log.Printf("Fetching historical data for single symbol: %s", symbol)
-		data, err := fetchHistoricalTickerData(symbol, startDate, endDate)
+	var data []StockData
+	for rows.Next() {
+		var d StockData
+		var timestamp int64
+		err := rows.Scan(
+			&timestamp,
+			&d.Open,
+			&d.High,
+			&d.Low,
+			&d.Close,
+			&d.AdjClose,
+			&d.Volume,
+		)
 		if err != nil {
-			sendJSONResponse(w, HandlerResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Failed to fetch historical data for %s: %v", symbol, err),
-			})
+			http.Error(w, fmt.Sprintf("Error scanning row: %v", err), http.StatusInternalServerError)
 			return
 		}
-		fetchErr = db.saveHistoricalData(data)
-	} else {
-		// Fetch data for all S&P 500 symbols
-		tickers, err := db.getActiveSP500Tickers()
-		if err != nil {
-			sendJSONResponse(w, HandlerResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Failed to get S&P 500 tickers: %v", err),
-			})
-			return
-		}
-
-		log.Printf("Found %d S&P 500 tickers to process", len(tickers))
-
-		// Use goroutines to fetch data concurrently
-		numWorkers := 20 // Back to 20 workers for better performance
-		jobs := make(chan string, len(tickers))
-		results := make(chan HistoricalResult, len(tickers))
-		rateLimiter := make(chan struct{}, numWorkers) // Rate limiter channel
-
-		// Start worker pool
-		var wg sync.WaitGroup
-		for i := 0; i < numWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for ticker := range jobs {
-					rateLimiter <- struct{}{} // Acquire rate limiter slot
-
-					log.Printf("Fetching historical data for %s", ticker)
-					data, err := fetchHistoricalTickerData(ticker, startDate, endDate)
-					if err != nil {
-						log.Printf("Error fetching historical data for %s: %v", ticker, err)
-						results <- HistoricalResult{Ticker: ticker, Err: err}
-						<-rateLimiter // Release rate limiter slot
-						continue
-					}
-
-					// Start a transaction for this symbol
-					tx, err := db.Begin()
-					if err != nil {
-						log.Printf("Error starting transaction for %s: %v", ticker, err)
-						results <- HistoricalResult{Ticker: ticker, Err: err}
-						<-rateLimiter // Release rate limiter slot
-						continue
-					}
-
-					// Prepare statement
-					stmt, err := tx.Prepare(`
-						INSERT OR REPLACE INTO stock_historical_data (
-							symbol, date, open, high, low, close, adj_close, volume
-						) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-					`)
-					if err != nil {
-						tx.Rollback()
-						log.Printf("Error preparing statement for %s: %v", ticker, err)
-						results <- HistoricalResult{Ticker: ticker, Err: err}
-						<-rateLimiter // Release rate limiter slot
-						continue
-					}
-
-					// Insert all data points for this symbol
-					for _, d := range data {
-						_, err := stmt.Exec(
-							d.Symbol,
-							d.Date.Unix(),
-							d.Open,
-							d.High,
-							d.Low,
-							d.Close,
-							d.AdjClose,
-							d.Volume,
-						)
-						if err != nil {
-							tx.Rollback()
-							stmt.Close()
-							log.Printf("Error inserting data for %s: %v", ticker, err)
-							results <- HistoricalResult{Ticker: ticker, Err: err}
-							<-rateLimiter // Release rate limiter slot
-							continue
-						}
-					}
-
-					// Commit transaction
-					stmt.Close()
-					if err := tx.Commit(); err != nil {
-						log.Printf("Error committing transaction for %s: %v", ticker, err)
-						results <- HistoricalResult{Ticker: ticker, Err: err}
-						<-rateLimiter // Release rate limiter slot
-						continue
-					}
-
-					results <- HistoricalResult{Ticker: ticker, Data: data}
-					<-rateLimiter // Release rate limiter slot
-				}
-			}()
-		}
-
-		// Send jobs to workers
-		for _, ticker := range tickers {
-			jobs <- ticker
-		}
-		close(jobs)
-
-		// Wait for all workers to complete
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
-
-		// Process results with progress tracking
-		var errors []error
-		var successCount int
-		totalTickers := len(tickers)
-		for result := range results {
-			if result.Err != nil {
-				errors = append(errors, fmt.Errorf("%s: %v", result.Ticker, result.Err))
-			} else {
-				successCount++
-			}
-			// Log progress every 10 tickers
-			if (successCount+len(errors))%10 == 0 {
-				log.Printf("Progress: %d/%d tickers processed (%d successful, %d failed)",
-					successCount+len(errors), totalTickers, successCount, len(errors))
-			}
-		}
-
-		if len(errors) > 0 {
-			// Log all errors but only return the first one in the response
-			for _, err := range errors {
-				log.Printf("Error: %v", err)
-			}
-			fetchErr = fmt.Errorf("encountered %d errors while processing tickers: %v", len(errors), errors[0])
-		}
-
-		log.Printf("Final results: %d/%d tickers processed successfully", successCount, totalTickers)
+		d.Symbol = symbol
+		d.Date = time.Unix(timestamp, 0)
+		data = append(data, d)
 	}
 
-	if fetchErr != nil {
-		sendJSONResponse(w, HandlerResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Failed to fetch historical data: %v", fetchErr),
-		})
-		return
-	}
-
-	duration := time.Since(start)
-	message := fmt.Sprintf("Successfully fetched historical data in %v", duration)
-	log.Printf(message)
-
-	sendJSONResponse(w, HandlerResponse{
-		Success: true,
-		Message: message,
-	})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
 }
 
 // fetchHistoricalTickerData fetches historical data for a single ticker from Yahoo Finance
@@ -1734,7 +1438,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if r.Method != http.MethodGet {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   "Method not allowed",
+			Message: "Method not allowed",
 		})
 		return
 	}
@@ -1749,7 +1453,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to create table: %v", err),
+			Message: fmt.Sprintf("Failed to create table: %v", err),
 		})
 		return
 	}
@@ -1759,7 +1463,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to fetch S&P 500 list: %v", err),
+			Message: fmt.Sprintf("Failed to fetch S&P 500 list: %v", err),
 		})
 		return
 	}
@@ -1769,7 +1473,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to begin transaction: %v", err),
+			Message: fmt.Sprintf("Failed to begin transaction: %v", err),
 		})
 		return
 	}
@@ -1780,7 +1484,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to clear existing data: %v", err),
+			Message: fmt.Sprintf("Failed to clear existing data: %v", err),
 		})
 		return
 	}
@@ -1793,7 +1497,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to prepare statement: %v", err),
+			Message: fmt.Sprintf("Failed to prepare statement: %v", err),
 		})
 		return
 	}
@@ -1804,7 +1508,7 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 		if err != nil {
 			sendJSONResponse(w, HandlerResponse{
 				Success: false,
-				Error:   fmt.Sprintf("Failed to insert stock %s: %v", stock.Symbol, err),
+				Message: fmt.Sprintf("Failed to insert stock %s: %v", stock.Symbol, err),
 			})
 			return
 		}
@@ -1814,15 +1518,216 @@ func updateSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
 	if err = tx.Commit(); err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to commit transaction: %v", err),
+			Message: fmt.Sprintf("Failed to commit transaction: %v", err),
 		})
 		return
 	}
+}
 
-	sendJSONResponse(w, HandlerResponse{
-		Success: true,
-		Message: fmt.Sprintf("Successfully updated %d S&P 500 stocks", len(stocks)),
+// stockHandler handles requests for stock data
+func stockHandler(w http.ResponseWriter, r *http.Request) {
+	symbol := chi.URLParam(r, "symbol")
+	if symbol == "" {
+		http.Error(w, "Symbol is required", http.StatusBadRequest)
+		return
+	}
+
+	// Query the database for stock data
+	var stock StockData
+	err := db.QueryRow(`
+		SELECT symbol, company_name, price, change_amount, change_percent, 
+			   volume, market_cap, previous_close, open_price, high, low, 
+			   fifty_two_week_high, fifty_two_week_low, last_updated
+		FROM stock_data 
+		WHERE symbol = ?
+	`, symbol).Scan(
+		&stock.Symbol,
+		&stock.CompanyName,
+		&stock.Price,
+		&stock.ChangeAmount,
+		&stock.ChangePercent,
+		&stock.Volume,
+		&stock.MarketCap,
+		&stock.PreviousClose,
+		&stock.OpenPrice,
+		&stock.High,
+		&stock.Low,
+		&stock.FiftyTwoWeekHigh,
+		&stock.FiftyTwoWeekLow,
+		&stock.LastUpdated,
+	)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "Stock not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stock)
+}
+
+// fillHistoricalDataHandler fills historical data for all stocks
+func fillHistoricalDataHandler(w http.ResponseWriter, r *http.Request) {
+	// Get list of active tickers
+	tickers, err := getActiveSP500Tickers(db)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get tickers: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Process each ticker
+	for _, symbol := range tickers {
+		// Get historical data
+		data, err := fetchHistoricalData(symbol)
+		if err != nil {
+			log.Printf("Failed to fetch historical data for %s: %v", symbol, err)
+			continue
+		}
+
+		// Save to database
+		if err := saveHistoricalData(db, symbol, data); err != nil {
+			log.Printf("Failed to save historical data for %s: %v", symbol, err)
+			continue
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "completed",
 	})
+}
+
+// fetchHistoricalData fetches historical data for a given symbol
+func fetchHistoricalData(symbol string) ([]StockData, error) {
+	// Implement the actual data fetching logic here
+	// For now, return empty data
+	return []StockData{}, nil
+}
+
+// saveHistoricalData saves historical stock data to the database
+func saveHistoricalData(db *sql.DB, symbol string, data []StockData) error {
+	// Begin transaction
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	// Prepare statement
+	stmt, err := tx.Prepare(`
+		INSERT INTO stock_historical_data (
+			symbol, date, open, high, low, close, adj_close, volume
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(symbol, date) DO UPDATE SET
+			open = excluded.open,
+			high = excluded.high,
+			low = excluded.low,
+			close = excluded.close,
+			adj_close = excluded.adj_close,
+			volume = excluded.volume
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Insert data
+	for _, d := range data {
+		_, err = stmt.Exec(
+			symbol,
+			d.Date.Unix(),
+			d.Open,
+			d.High,
+			d.Low,
+			d.Close,
+			d.AdjClose,
+			d.Volume,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert historical data: %v", err)
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	return nil
+}
+
+// getActiveSP500Tickers returns a list of active S&P 500 tickers from the database
+func getActiveSP500Tickers(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT symbol 
+		FROM stock_data 
+		WHERE symbol IN (
+			SELECT DISTINCT symbol 
+			FROM stock_historical_data
+		)
+		ORDER BY symbol
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tickers: %v", err)
+	}
+	defer rows.Close()
+
+	var tickers []string
+	for rows.Next() {
+		var symbol string
+		if err := rows.Scan(&symbol); err != nil {
+			return nil, fmt.Errorf("failed to scan ticker: %v", err)
+		}
+		tickers = append(tickers, symbol)
+	}
+
+	return tickers, nil
+}
+
+// sendJSONResponse sends a JSON response with the given HandlerResponse
+func sendJSONResponse(w http.ResponseWriter, response HandlerResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// tokenFromFile retrieves a token from a local file
+func tokenFromFile(file string) (*oauth2.Token, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tok := &oauth2.Token{}
+	err = json.NewDecoder(f).Decode(tok)
+	return tok, err
+}
+
+// extractMessageContent extracts content from a Gmail message
+func extractMessageContent(message *gmail.Message) error {
+	if message.Payload == nil {
+		return fmt.Errorf("message payload is nil")
+	}
+
+	// Process headers
+	for _, header := range message.Payload.Headers {
+		switch header.Name {
+		case "Subject":
+			message.Payload.Headers = append(message.Payload.Headers, &gmail.MessagePartHeader{
+				Name:  "Subject",
+				Value: header.Value,
+			})
+		case "From":
+			message.Payload.Headers = append(message.Payload.Headers, &gmail.MessagePartHeader{
+				Name:  "From",
+				Value: header.Value,
+			})
+		}
+	}
+
+	return nil
 }
 
 // fetchSP500List fetches the current S&P 500 constituents from local HTML file
@@ -1921,123 +1826,29 @@ func fetchSP500List() ([]SP500Stock, error) {
 }
 
 // listSP500Handler returns the current list of S&P 500 stocks
-func listSP500Handler(w http.ResponseWriter, r *http.Request, db *DB) {
+func listSP500Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   "Method not allowed",
+			Message: "Method not allowed",
+			Data:    nil,
 		})
 		return
 	}
 
-	rows, err := db.Query(`
-		SELECT ticker
-		FROM sp500_list_2025_jun
-		ORDER BY ticker
-	`)
+	stocks, err := fetchSP500List()
 	if err != nil {
 		sendJSONResponse(w, HandlerResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Failed to query database: %v", err),
+			Message: fmt.Sprintf("Failed to fetch S&P 500 list: %v", err),
+			Data:    nil,
 		})
 		return
 	}
-	defer rows.Close()
 
-	var stocks []SP500Stock
-	for rows.Next() {
-		var stock SP500Stock
-		err := rows.Scan(&stock.Symbol)
-		if err != nil {
-			sendJSONResponse(w, HandlerResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Failed to scan row: %v", err),
-			})
-			return
-		}
-		stocks = append(stocks, stock)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stocks)
-}
-
-func readmeHandler(w http.ResponseWriter, r *http.Request) {
-	// Read the README.md file
-	content, err := os.ReadFile("README.md")
-	if err != nil {
-		http.Error(w, "Failed to read README.md", http.StatusInternalServerError)
-		return
-	}
-
-	// Convert markdown to HTML
-	html := markdownToHTML(content)
-
-	// Add CSS styling
-	styledHTML := fmt.Sprintf(`
-		<!DOCTYPE html>
-		<html>
-		<head>
-			<meta charset="UTF-8">
-			<meta name="viewport" content="width=device-width, initial-scale=1.0">
-			<title>API Documentation</title>
-			<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown.min.css">
-			<style>
-				.markdown-body {
-					box-sizing: border-box;
-					min-width: 200px;
-					max-width: 980px;
-					margin: 0 auto;
-					padding: 45px;
-				}
-				@media (max-width: 767px) {
-					.markdown-body {
-						padding: 15px;
-					}
-				}
-				body {
-					background-color: #f6f8fa;
-				}
-				pre {
-					background-color: #f6f8fa;
-					border-radius: 6px;
-					padding: 16px;
-					overflow: auto;
-				}
-				code {
-					background-color: rgba(175,184,193,0.2);
-					border-radius: 6px;
-					padding: 0.2em 0.4em;
-					font-size: 85%%;
-				}
-			</style>
-		</head>
-		<body>
-			<article class="markdown-body">
-				%s
-			</article>
-		</body>
-		</html>
-	`, html)
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(styledHTML))
-}
-
-func markdownToHTML(md []byte) string {
-	// Create a markdown parser with extensions
-	extensions := parser.CommonExtensions | parser.AutoHeadingIDs | parser.NoEmptyLineBeforeBlock
-	p := parser.NewWithExtensions(extensions)
-
-	// Parse the markdown content
-	parsedContent := p.Parse(md)
-
-	// Create HTML renderer with default options
-	htmlFlags := mdhtml.CommonFlags | mdhtml.HrefTargetBlank
-	opts := mdhtml.RendererOptions{Flags: htmlFlags}
-	renderer := mdhtml.NewRenderer(opts)
-
-	// Convert to HTML
-	html := markdown.Render(parsedContent, renderer)
-	return string(html)
+	sendJSONResponse(w, HandlerResponse{
+		Success: true,
+		Message: fmt.Sprintf("Successfully retrieved %d S&P 500 stocks", len(stocks)),
+		Data:    stocks,
+	})
 }
