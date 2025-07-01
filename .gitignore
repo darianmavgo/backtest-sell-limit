@@ -1,0 +1,10 @@
+config.json
+.air.toml.swp
+backtest_sell_limits.db-shm
+backtest_sell_limits.db-wal
+*.pyc
+
+bin/** 
+
+main
+

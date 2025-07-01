@@ -130,13 +130,23 @@ def calculate_portfolio_value():
     return total_value
 
 def setup_logging():
-    """Configure logging to use the DatabaseLogHandler."""
+    """Configure logging to use both DatabaseLogHandler and console output."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     # Clear any existing handlers
     logger.handlers = []
+    
+    # Add database handler
     db_handler = DatabaseLogHandler(db)
     logger.addHandler(db_handler)
+    
+    # Add console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
     return logger
 
 def run_backtest():

@@ -41,30 +41,38 @@ A Python and Go application for backtesting stock portfolio strategies with a fo
 
 ## API Endpoints
 
+### Home & Navigation
+- [`GET /`](#home) - Home page with navigation and system status
+
 ### Authentication
-- `GET /login` - Initiates Google OAuth2 login flow
-- `GET /callback` - OAuth2 callback handler for processing authentication
+- [`GET /login`](#authentication) - Initiates Google OAuth2 login flow
+- [`GET /callback`](#authentication) - OAuth2 callback handler for processing authentication
 
 ### Email Processing
-- `GET /batchget` - Fetches and processes emails from Gmail with specific labels
-- `GET /fixdate` - Fixes and standardizes email dates in the database
+- [`GET /batchget`](#email-processing) - Fetches and processes emails from Gmail with specific labels
+- [`GET /fixdate`](#email-processing) - Fixes and standardizes email dates in the database
 
-### S&P 500 Data
-- `GET /api/sp500/update` - Fetches current S&P 500 constituents from Wikipedia and stores them in the database
-- `GET /api/sp500/list` - Returns the current list of S&P 500 stocks
-- `GET /api/stock/{symbol}` - Fetches real-time data for a specific stock
-- `GET /api/stock/historical/{symbol}` - Retrieves historical data for a specific stock
-- `GET /api/stock/historical/fill` - Fills the historical_data table with data for all S&P 500 stocks
+### Stock Data Management
+- [`GET /api/stock/{symbol}`](#stock-data) - Fetches real-time data for a specific stock symbol
+- [`GET /api/stock/historical/{symbol}`](#stock-data) - Retrieves historical data for a specific stock symbol
+- [`GET /api/stock/historical/fill`](#stock-data) - Fills historical data for all S&P 500 stocks
+- [`GET /sp500`](#stock-data) - Fetches current stock data for all S&P 500 companies
+- [`GET /api/sp500/update`](#stock-data) - Updates S&P 500 constituents list from Wikipedia
+- [`GET /api/sp500/list`](#stock-data) - Returns the current list of S&P 500 stocks
 
 ### Portfolio Management
-- `GET /api/portfolio` - Returns the current portfolio holdings and values
-- `GET /api/portfolio/backtest` - Runs backtesting simulation on the portfolio
-- `GET /api/portfolio/performance` - Retrieves historical portfolio performance metrics
+- [`GET /api/portfolio/backtest`](#portfolio-management) - Runs backtesting simulation on the portfolio
+- [`GET /api/portfolio`](#portfolio-management) - Returns current portfolio holdings and values
+- [`GET /api/portfolio/performance`](#portfolio-management) - Retrieves historical portfolio performance metrics
 
-### System Status
-- `GET /` - Home page with navigation and system status
-- `GET /health` - Health check endpoint for monitoring
-- `GET /metrics` - Returns system metrics and statistics
+### Database Management
+- [`GET /api/tables`](#database-management) - Lists all available database tables
+- [`GET /api/tables/{table}`](#database-management) - Retrieves paginated data from a specific table
+  - Query parameters: `page` (default: 1), `pageSize` (default: 100)
+
+### System Status & Monitoring
+- [`GET /health`](#system-monitoring) - Health check endpoint for monitoring
+- [`GET /metrics`](#system-monitoring) - Returns system metrics and statistics
 
 ## Project Structure
 
@@ -198,6 +206,112 @@ This will automatically rebuild and restart the server when code changes are det
 ### Backtesting Engine
 - Efficient database queries
 - Connection pooling
+
+## Detailed API Documentation
+
+### Home
+The home page provides navigation to all major features and system status information.
+
+**Endpoint:** `GET /`  
+**Description:** Serves the main HTML interface with links to authentication, email processing, and stock data features.  
+**Response:** HTML page with navigation buttons and system information.
+
+### Authentication
+OAuth2 integration with Google for secure email access.
+
+**Login Endpoint:** `GET /login`  
+**Description:** Initiates Google OAuth2 authentication flow.  
+**Response:** JSON with authorization URL for Google login.
+
+**Callback Endpoint:** `GET /callback`  
+**Description:** Handles OAuth2 callback from Google authentication.  
+**Parameters:**
+- `state` - OAuth2 state parameter for security
+- `code` - Authorization code from Google
+
+### Email Processing
+Gmail integration for fetching and processing backtest-related emails.
+
+**Batch Get Endpoint:** `GET /batchget`  
+**Description:** Fetches emails from Gmail with specified labels and stores them in the database.  
+**Parameters:**
+- `label` - Gmail label to filter emails (optional, defaults to configured label)
+
+**Fix Date Endpoint:** `GET /fixdate`  
+**Description:** Standardizes and fixes email date formats in the database.  
+**Response:** JSON with processing results and number of emails updated.
+
+### Stock Data
+Comprehensive stock data management for S&P 500 companies.
+
+**Individual Stock Data:** `GET /api/stock/{symbol}`  
+**Description:** Retrieves real-time stock data for a specific symbol.  
+**Parameters:**
+- `{symbol}` - Stock ticker symbol (e.g., AAPL, GOOGL)
+**Response:** JSON with current price, volume, market cap, and other metrics.
+
+**Historical Stock Data:** `GET /api/stock/historical/{symbol}`  
+**Description:** Fetches historical price data for a specific stock.  
+**Parameters:**
+- `{symbol}` - Stock ticker symbol
+- Query parameters for date range and period
+
+**Fill Historical Data:** `GET /api/stock/historical/fill`  
+**Description:** Bulk operation to fill historical data for all S&P 500 stocks.  
+**Response:** Streaming progress updates during data fetching process.
+
+**S&P 500 Data Fetch:** `GET /sp500`  
+**Description:** Fetches current stock data for all S&P 500 companies using concurrent processing.  
+**Response:** JSON with operation results and processing statistics.
+
+**Update S&P 500 List:** `GET /api/sp500/update`  
+**Description:** Updates the S&P 500 constituents list from Wikipedia.  
+**Response:** JSON with updated company list and changes.
+
+**List S&P 500 Stocks:** `GET /api/sp500/list`  
+**Description:** Returns the current list of S&P 500 companies.  
+**Response:** JSON array of stock symbols and company names.
+
+### Portfolio Management
+Backtesting and portfolio analysis functionality.
+
+**Portfolio Backtest:** `GET /api/portfolio/backtest`  
+**Description:** Runs a comprehensive backtest simulation on the portfolio using historical data.  
+**Response:** Streaming results with performance metrics, trade history, and analysis.
+
+**Portfolio Holdings:** `GET /api/portfolio`  
+**Description:** Returns current portfolio holdings and calculated values.  
+**Response:** JSON with positions, current values, and allocation percentages.
+
+**Portfolio Performance:** `GET /api/portfolio/performance`  
+**Description:** Retrieves historical performance metrics and analytics.  
+**Response:** JSON with returns, volatility, drawdowns, and benchmark comparisons.
+
+### Database Management
+Direct database access and table browsing capabilities.
+
+**List Tables:** `GET /api/tables`  
+**Description:** Returns a list of all available database tables.  
+**Response:** JSON array of table names.
+
+**Table Data:** `GET /api/tables/{table}`  
+**Description:** Retrieves paginated data from a specific database table.  
+**Parameters:**
+- `{table}` - Table name
+- `page` - Page number (default: 1)
+- `pageSize` - Records per page (default: 100)
+**Response:** JSON array of table records with pagination.
+
+### System Monitoring
+Health checks and system metrics for monitoring application status.
+
+**Health Check:** `GET /health`  
+**Description:** Basic health check endpoint for load balancers and monitoring systems.  
+**Response:** JSON with system status and basic metrics.
+
+**System Metrics:** `GET /metrics`  
+**Description:** Detailed system metrics including database connections, processing statistics, and performance data.  
+**Response:** JSON with comprehensive system metrics.
 - Transaction batching
 - Indexed database tables
 

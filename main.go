@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/mattn/go-sqlite3"
-	"golang.org/x/net/html"
+	nethtml "golang.org/x/net/html"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
@@ -540,6 +541,232 @@ func createTables(db *sql.DB) error {
 	return nil
 }
 
+func convertMarkdownToHTML(content string) string {
+	// Start with HTML template
+	html := `<!DOCTYPE html>
+<html>
+<head>
+    <title>API Documentation</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #fafafa;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; }
+        h3 { color: #7f8c8d; margin-top: 25px; }
+        h4 { color: #95a5a6; margin-top: 20px; }
+        .route-link {
+            display: inline-block;
+            background: #3498db;
+            color: white !important;
+            padding: 6px 12px;
+            text-decoration: none;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 14px;
+            margin: 2px 0;
+            transition: background-color 0.3s ease;
+        }
+        .route-link:hover {
+            background: #2980b9;
+            text-decoration: none;
+        }
+        .get { background: #27ae60; }
+        .get:hover { background: #219a52; }
+        .post { background: #f39c12; }
+        .post:hover { background: #e67e22; }
+        .put { background: #9b59b6; }
+        .put:hover { background: #8e44ad; }
+        .delete { background: #e74c3c; }
+        .delete:hover { background: #c0392b; }
+        code {
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 14px;
+        }
+        pre {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            border-left: 4px solid #3498db;
+        }
+        ul { padding-left: 20px; }
+        li { margin: 8px 0; }
+        .endpoint-section {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+            border-left: 4px solid #3498db;
+        }
+        .endpoint-title {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+`
+
+	// Convert basic markdown elements
+	lines := strings.Split(content, "\n")
+	var result []string
+	inCodeBlock := false
+
+	for i, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			if inCodeBlock {
+				result = append(result, "</pre>")
+			} else {
+				result = append(result, "<pre><code>")
+			}
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+
+		if inCodeBlock {
+			// Escape HTML characters manually
+			escaped := strings.ReplaceAll(line, "&", "&amp;")
+			escaped = strings.ReplaceAll(escaped, "<", "&lt;")
+			escaped = strings.ReplaceAll(escaped, ">", "&gt;")
+			escaped = strings.ReplaceAll(escaped, "\"", "&quot;")
+			result = append(result, escaped)
+			continue
+		}
+
+		// Headers
+		if strings.HasPrefix(line, "#### ") {
+			result = append(result, "<h4>"+strings.TrimPrefix(line, "#### ")+"</h4>")
+		} else if strings.HasPrefix(line, "### ") {
+			result = append(result, "<h3>"+strings.TrimPrefix(line, "### ")+"</h3>")
+		} else if strings.HasPrefix(line, "## ") {
+			result = append(result, "<h2>"+strings.TrimPrefix(line, "## ")+"</h2>")
+		} else if strings.HasPrefix(line, "# ") {
+			result = append(result, "<h1>"+strings.TrimPrefix(line, "# ")+"</h1>")
+		} else if strings.HasPrefix(line, "- ") {
+			// Handle list items with route links
+			listItem := strings.TrimPrefix(line, "- ")
+
+			// Convert route links to clickable links
+			listItem = convertRouteLinks(listItem)
+
+			// Check if we need to start a new list
+			if i == 0 || !strings.HasPrefix(lines[i-1], "- ") {
+				result = append(result, "<ul>")
+			}
+
+			result = append(result, "<li>"+listItem+"</li>")
+
+			// Check if we need to end the list
+			if i == len(lines)-1 || !strings.HasPrefix(lines[i+1], "- ") {
+				result = append(result, "</ul>")
+			}
+		} else if strings.TrimSpace(line) == "" {
+			result = append(result, "<br>")
+		} else {
+			// Regular paragraph
+			processedLine := convertRouteLinks(line)
+			result = append(result, "<p>"+processedLine+"</p>")
+		}
+	}
+
+	html += strings.Join(result, "\n")
+	html += `
+    </div>
+</body>
+</html>`
+
+	return html
+}
+
+func convertRouteLinks(text string) string {
+	// Pattern to match route links like [`GET /api/stock/{symbol}`](#stock-data)
+	re := regexp.MustCompile(`\[` + "`" + `([A-Z]+)\s+([^` + "`" + `]+)` + "`" + `\]\([^)]+\)`)
+
+	return re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract method and path
+		parts := re.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+
+		method := parts[1]
+		path := parts[2]
+
+		// Convert path parameters to examples
+		examplePath := convertPathToExample(path)
+
+		// Get CSS class for HTTP method
+		class := strings.ToLower(method)
+
+		return fmt.Sprintf(`<a href="%s" class="route-link %s" target="_blank">%s %s</a>`,
+			examplePath, class, method, path)
+	})
+}
+
+func convertPathToExample(path string) string {
+	// Convert path parameters to example values
+	examples := map[string]string{
+		"{symbol}": "AAPL",
+		"{table}":  "stock_data",
+	}
+
+	result := path
+	for param, example := range examples {
+		result = strings.ReplaceAll(result, param, example)
+	}
+
+	return result
+}
+
+func readmeHandler(w http.ResponseWriter, r *http.Request) {
+	// Read the README.md file
+	readmeContent, err := os.ReadFile("README.md")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to read README.md: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Convert markdown to HTML with clickable routes
+	htmlContent := convertMarkdownToHTML(string(readmeContent))
+
+	// Set content type to HTML
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(htmlContent))
+}
+
 func main() {
 	// Create router
 	r := chi.NewRouter()
@@ -549,6 +776,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 
 	// Routes
+	r.Get("/readme", readmeHandler)
 	r.Get("/api/stock/{symbol}", stockHandler)
 	r.Get("/api/stock/historical/{symbol}", historicalDataHandler)
 	r.Get("/api/stock/historical/fill", fillHistoricalDataHandler)
@@ -661,8 +889,8 @@ func main() {
 	})
 
 	// Start the server
-	fmt.Printf("Server is running on port %s\n", serverPort)
-	log.Fatal(http.ListenAndServe(":"+serverPort, r))
+	fmt.Printf("Server is running on port %s\n", C.Port)
+	log.Fatal(http.ListenAndServe(":"+C.Port, r))
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
@@ -1739,15 +1967,15 @@ func fetchSP500List() ([]SP500Stock, error) {
 	}
 
 	// Parse the HTML document
-	doc, err := html.Parse(bytes.NewReader(content))
+	doc, err := nethtml.Parse(bytes.NewReader(content))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse HTML: %v", err)
 	}
 
 	var stocks []SP500Stock
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "table" {
+	var f func(*nethtml.Node)
+	f = func(n *nethtml.Node) {
+		if n.Type == nethtml.ElementNode && n.Data == "table" {
 			// Check if this is the S&P 500 table
 			for _, a := range n.Attr {
 				if a.Key == "id" && a.Val == "constituents" {
@@ -1756,9 +1984,9 @@ func fetchSP500List() ([]SP500Stock, error) {
 					var inRow bool
 					var colIndex int
 
-					var parseRow func(*html.Node)
-					parseRow = func(n *html.Node) {
-						if n.Type == html.ElementNode {
+					var parseRow func(*nethtml.Node)
+					parseRow = func(n *nethtml.Node) {
+						if n.Type == nethtml.ElementNode {
 							switch n.Data {
 							case "tr":
 								if n.Parent != nil && n.Parent.Data == "tbody" {
@@ -1774,7 +2002,7 @@ func fetchSP500List() ([]SP500Stock, error) {
 								case 0: // Symbol column
 									// Find the first anchor tag
 									for c := n.FirstChild; c != nil; c = c.NextSibling {
-										if c.Type == html.ElementNode && c.Data == "a" {
+										if c.Type == nethtml.ElementNode && c.Data == "a" {
 											if c.FirstChild != nil {
 												currentStock.Symbol = strings.TrimSpace(c.FirstChild.Data)
 											}
@@ -1784,7 +2012,7 @@ func fetchSP500List() ([]SP500Stock, error) {
 								case 1: // Security Name column
 									// Find the first anchor tag
 									for c := n.FirstChild; c != nil; c = c.NextSibling {
-										if c.Type == html.ElementNode && c.Data == "a" {
+										if c.Type == nethtml.ElementNode && c.Data == "a" {
 											if c.FirstChild != nil {
 												currentStock.SecurityName = strings.TrimSpace(c.FirstChild.Data)
 											}
