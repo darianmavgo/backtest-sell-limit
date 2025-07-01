@@ -1,4 +1,4 @@
-module backtest-sell-limit
+module github.com/darianmavgo/backtest-sell-limit
 
 go 1.23.0
 

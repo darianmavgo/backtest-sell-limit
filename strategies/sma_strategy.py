@@ -8,7 +8,7 @@ import os
 
 class StrategyHistory(bt.Strategy):
     params = (
-        ('db_path', 'strategy_history.db'),
+        ('db_path', 'backtest-sell-limit.db'),
         ('symbol', 'TSLA'),
     )
 

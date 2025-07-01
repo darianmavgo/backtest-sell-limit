@@ -1,0 +1,52 @@
+<html>
+		<head>
+			<title>Gmail Backtest Email Processor</title>
+			<style>
+				body { 
+					font-family: Arial, sans-serif; 
+					margin: 40px auto;
+					max-width: 800px;
+					padding: 20px;
+				}
+				.button {
+					display: inline-block;
+					padding: 10px 20px;
+					background-color: #4285f4;
+					color: white;
+					text-decoration: none;
+					border-radius: 4px;
+					margin: 10px 0;
+				}
+				.button:hover {
+					background-color: #357abd;
+				}
+				.button.stock {
+					background-color: #34a853;
+				}
+				.button.stock:hover {
+					background-color: #2d8f45;
+				}
+			</style>
+		</head>
+		<body>
+			<h1>Gmail Backtest Email Processor</h1>
+			<p>Process your backtest emails from Gmail and fetch S&P 500 stock data.</p>
+			<div>
+				<a href="/login" class="button">Login with Google</a>
+			</div>
+			<div id="actions" style="display:none;">
+				<a href="/batchget" class="button">Fetch Emails</a>
+				<a href="/fixdate" class="button">Fix Dates</a>
+			</div>
+			<div>
+				<h2>Stock Data</h2>
+				<a href="/sp500" class="button stock">Fetch S&P 500 Data</a>
+				<p><small>Fetches current stock data for all S&P 500 companies using concurrent goroutines.</small></p>
+			</div>
+			<div>
+				<h2>Historical Stock Data</h2>
+				<a href="/historical-data?table=sp500_list_2025_jun&start_date=2023-01-01&end_date=2023-12-31" class="button stock">Fetch Historical Data (Example)</a>
+				<p><small>Fetches historical stock data for a given table, start date, and end date.</small></p>
+			</div>
+		</body>
+	</html>

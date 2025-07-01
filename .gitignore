@@ -1,10 +1,28 @@
 config.json
 .air.toml.swp
+backtest-sell-limit
 backtest_sell_limits.db-shm
 backtest_sell_limits.db-wal
-*.pyc
 
 bin/** 
-
+tmp/**
 main
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Go
+/bin/
+*.exe
+
+# General
+.DS_Store
+*.log
+?_journal_mode=WAL
+backtest_sell_limits.db-shm
+backtest_sell_limits.db-wal
+.gitignore
+.gitignore
