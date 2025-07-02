@@ -11,12 +11,12 @@ import logging
 import os
 from strategies.BuySP500Up20 import BuySP500Up20
 
-# Configuration
+# Configuration  
 DB_FILE = "backtest_sell_limits.db"
 START_DATE = "2024-06-01"
 END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0
-MAX_STOCKS = 5  # Set to integer to limit stocks for testing, None for all
+MAX_STOCKS = None  # Set to integer to limit stocks for testing, None for all
 
 def setup_logging():
     """Setup simple console logging."""
