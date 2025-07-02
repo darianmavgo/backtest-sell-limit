@@ -29,6 +29,12 @@ class SQLiteConnectionManager:
                     check_same_thread=False,  # Allow multi-threading
                     isolation_level='DEFERRED'  # Use explicit transaction control
                 )
+                # Enable WAL mode for better concurrency
+                self._conn.execute("PRAGMA journal_mode=WAL;")
+                self._conn.execute("PRAGMA synchronous=NORMAL;")
+                self._conn.execute("PRAGMA cache_size=10000;")
+                self._conn.execute("PRAGMA temp_store=memory;")
+                self._conn.commit()
         except Exception as e:
             print(f"Error connecting to database: {e}", file=sys.stderr)
             raise

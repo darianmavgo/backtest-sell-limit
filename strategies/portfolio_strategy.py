@@ -11,6 +11,7 @@ class PortfolioStrategy(bt.Strategy):
         self.stocks_bought = False
         self.purchase_prices = {}  # Keep track of purchase prices
         self.daily_values = []  # Track daily portfolio values
+        self.trade_queue = []  # Queue for deferred database writes
         
     def next(self):
         # Track daily portfolio value
@@ -72,31 +73,25 @@ class PortfolioStrategy(bt.Strategy):
             logging.info(message, extra=extra_data)
 
     def notify_trade(self, trade):
-        """Log trade notifications to the database."""
+        """Queue trade notifications for database insertion."""
         if trade.isclosed:
             # Calculate PnL percentage
             pnl_percent = (trade.pnl / abs(trade.price)) * 100 if trade.price != 0 else 0
             
-            # Import here to avoid circular imports
-            from portfolio_backtest import db
-            
-            # Ensure the table exists
-            db.execute_sql_file("create_strategy_history_table.sql")
-            
-            # Log the trade
-            db.execute_sql_file("insert_strategy_history.sql", (
-                "PortfolioStrategy_20_percent_sell_limit",  # strategy_name
-                trade.data._name,  # symbol
-                "LONG" if trade.size > 0 else "SHORT",  # trade_type
-                "CLOSE",  # trade_status
-                abs(trade.size),  # size
-                trade.price,  # price
-                abs(trade.value),  # value
-                trade.pnl,  # pnl
-                pnl_percent,  # pnl_percent
-                trade.commission,  # commission
-            ))
-            db.commit()
+            # Queue the trade for database insertion
+            self.trade_queue.append({
+                'strategy_name': "PortfolioStrategy_20_percent_sell_limit",
+                'symbol': trade.data._name,
+                'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                'trade_status': "CLOSE",
+                'quantity': abs(trade.size),
+                'price': trade.price,
+                'value': abs(trade.value),
+                'pnl': trade.pnl,
+                'pnl_percent': pnl_percent,
+                'commission': trade.commission,
+                'trade_date': self.datetime.date().strftime('%Y-%m-%d')
+            })
             
             # Log trade details
             logging.info(
@@ -113,26 +108,20 @@ class PortfolioStrategy(bt.Strategy):
                 }
             )
         elif trade.isopen:
-            # Log trade opening
-            from portfolio_backtest import db
-            
-            # Ensure the table exists
-            db.execute_sql_file("create_strategy_history_table.sql")
-            
-            # Log the trade
-            db.execute_sql_file("insert_strategy_history.sql", (
-                "PortfolioStrategy_20_percent_sell_limit",  # strategy_name
-                trade.data._name,  # symbol
-                "LONG" if trade.size > 0 else "SHORT",  # trade_type
-                "OPEN",  # trade_status
-                abs(trade.size),  # size
-                trade.price,  # price
-                abs(trade.value),  # value
-                0,  # pnl (not realized yet)
-                0,  # pnl_percent (not realized yet)
-                trade.commission,  # commission
-            ))
-            db.commit()
+            # Queue the trade for database insertion
+            self.trade_queue.append({
+                'strategy_name': "PortfolioStrategy_20_percent_sell_limit",
+                'symbol': trade.data._name,
+                'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                'trade_status': "OPEN",
+                'quantity': abs(trade.size),
+                'price': trade.price,
+                'value': abs(trade.value),
+                'pnl': 0,  # not realized yet
+                'pnl_percent': 0,  # not realized yet
+                'commission': trade.commission,
+                'trade_date': self.datetime.date().strftime('%Y-%m-%d')
+            })
             
             logging.info(
                 f"Trade Opened: {trade.data._name} - Size: {abs(trade.size)} @ ${trade.price:.2f}",
@@ -152,7 +141,12 @@ class PortfolioStrategy(bt.Strategy):
         total_return = (final_value - self.initial_cash) / self.initial_cash * 100
         
         # Import here to avoid circular imports
-        from portfolio_backtest import save_backtest_results
+        from portfolio_backtest import save_backtest_results, process_trade_queue
+        
+        # Process queued trades first
+        if self.trade_queue:
+            logging.info(f"Processing {len(self.trade_queue)} queued trades...")
+            process_trade_queue(self.trade_queue)
         
         # Save results
         save_backtest_results(

@@ -1,1 +1,1 @@
-SELECT ticker FROM {ticker_table} WHERE is_active = 1; 
+SELECT symbol FROM {ticker_table}; 

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -43,34 +44,44 @@ func readmeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(htmlContent))
 }
 
-// portfolioBacktestHandler runs the portfolio backtest and streams the output
+// portfolioBacktestHandler runs the portfolio backtest using Python script
 func portfolioBacktestHandler(w http.ResponseWriter, r *http.Request) {
-	// Get list of active tickers
-	tickers, err := getActiveSP500Tickers(BacktestDB)
+	log.Printf("Starting portfolio backtest...")
+	
+	// Run the Python backtest script
+	cmd := exec.Command("python3", "portfolio_backtest.py")
+	cmd.Dir = "." // Run from the current directory
+	
+	// Capture both stdout and stderr
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get tickers: %v", err), http.StatusInternalServerError)
+		log.Printf("Error running backtest: %v", err)
+		log.Printf("Python output: %s", string(output))
+		http.Error(w, fmt.Sprintf("Failed to run backtest: %v\nOutput: %s", err, string(output)), http.StatusInternalServerError)
 		return
 	}
-
-	// Process each ticker
-	for _, symbol := range tickers {
-		// Get historical data
-		data, err := fetchHistoricalData(symbol)
-		if err != nil {
-			log.Printf("Failed to fetch historical data for %s: %v", symbol, err)
-			continue
-		}
-
-		// Save to database
-		if err := saveHistoricalData(BacktestDB, symbol, data); err != nil {
-			log.Printf("Failed to save historical data for %s: %v", symbol, err)
-			continue
+	
+	log.Printf("Backtest completed successfully")
+	log.Printf("Python output: %s", string(output))
+	
+	// Check if any trades were recorded
+	rows, err := BacktestDB.Query("SELECT COUNT(*) FROM strategy_history")
+	if err != nil {
+		log.Printf("Error querying strategy_history: %v", err)
+	} else {
+		defer rows.Close()
+		var count int
+		if rows.Next() {
+			rows.Scan(&count)
+			log.Printf("Total trades recorded: %d", count)
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "completed",
+		"message": "Portfolio backtest completed successfully",
+		"output": string(output),
 	})
 }
 
@@ -699,8 +710,12 @@ func saveHistoricalData(db *sql.DB, symbol string, data []types.StockData) error
 // getActiveSP500Tickers returns a list of active S&P 500 tickers from the database
 func getActiveSP500Tickers(db *sql.DB) ([]string, error) {
 	rows, err := BacktestDB.Query(`
-		SELECT DISTINCT symbol 
-		FROM stock_historical_data
+		SELECT symbol 
+		FROM stock_data 
+		WHERE symbol IN (
+			SELECT DISTINCT symbol 
+			FROM stock_historical_data
+		)
 		ORDER BY symbol
 	`)
 	if err != nil {

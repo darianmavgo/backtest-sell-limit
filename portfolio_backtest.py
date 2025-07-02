@@ -13,7 +13,7 @@ from strategies import BracketStrategy, PortfolioStrategy
 
 # Global settings
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_sell_limits.db")
-TICKER_TABLE = "sp500_list_2025_jun"
+TICKER_TABLE = "ticker_list"
 START_DATE = "2024-05-01"
 END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0 # A large amount to ensure any trade can be made
@@ -26,14 +26,14 @@ def get_sp500_tickers():
     try:
         query = db.load_sql_query("get_sp500_tickers.sql").format(ticker_table=TICKER_TABLE)
         df = pd.read_sql_query(query, db.get_connection())
-        return df['ticker'].tolist()
+        return df['symbol'].tolist()
     except sqlite3.OperationalError as e:
         if "database is locked" in str(e).lower() or "unable to open database file" in str(e).lower():
             if db.kill_locks():
                 # Retry after clearing locks
                 try:
                     df = pd.read_sql_query(query, db.get_connection())
-                    return df['ticker'].tolist()
+                    return df['symbol'].tolist()
                 except Exception as retry_error:
                     print(f"Error fetching tickers after lock cleanup: {retry_error}")
                     return []
@@ -58,6 +58,35 @@ def get_historical_data(symbol, start_date, end_date):
     except Exception as e:
         logging.error(f"Error fetching historical data for {symbol}: {e}")
         return None
+
+def process_trade_queue(trade_queue):
+    """Process queued trades and insert them into strategy_history table"""
+    try:
+        # Ensure the table exists
+        db.execute_sql_file("create_strategy_history_table.sql")
+        
+        # Process each trade
+        for trade_data in trade_queue:
+            db.execute_sql_file("insert_strategy_history.sql", (
+                trade_data['strategy_name'],
+                trade_data['symbol'],
+                trade_data['trade_type'],
+                trade_data['trade_status'],
+                trade_data['quantity'],
+                trade_data['price'],
+                trade_data['value'],
+                trade_data['pnl'],
+                trade_data['pnl_percent'],
+                trade_data['commission'],
+                trade_data['trade_date']
+            ))
+        
+        db.commit()
+        logging.info(f"Successfully processed {len(trade_queue)} trades to strategy_history")
+        
+    except Exception as e:
+        logging.error(f"Error processing trade queue: {e}")
+        db.rollback()
 
 def save_backtest_results(strategy_name, daily_values, initial_value, final_value, total_return):
     """Save backtest results to SQLite database"""
@@ -130,15 +159,15 @@ def calculate_portfolio_value():
     return total_value
 
 def setup_logging():
-    """Configure logging to use both DatabaseLogHandler and console output."""
+    """Configure logging to use console output only (disable database logging for now)."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     # Clear any existing handlers
     logger.handlers = []
     
-    # Add database handler
-    db_handler = DatabaseLogHandler(db)
-    logger.addHandler(db_handler)
+    # Temporarily disable database handler due to concurrent access issues
+    # db_handler = DatabaseLogHandler(db)
+    # logger.addHandler(db_handler)
     
     # Add console handler
     console_handler = logging.StreamHandler(sys.stdout)

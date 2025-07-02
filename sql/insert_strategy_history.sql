@@ -3,10 +3,11 @@ INSERT INTO strategy_history (
     symbol,
     trade_type,
     trade_status,
-    size,
+    quantity,
     price,
     value,
     pnl,
     pnl_percent,
-    commission
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?); 
+    commission,
+    trade_date
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?); 
