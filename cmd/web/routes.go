@@ -699,12 +699,8 @@ func saveHistoricalData(db *sql.DB, symbol string, data []types.StockData) error
 // getActiveSP500Tickers returns a list of active S&P 500 tickers from the database
 func getActiveSP500Tickers(db *sql.DB) ([]string, error) {
 	rows, err := BacktestDB.Query(`
-		SELECT symbol 
-		FROM stock_data 
-		WHERE symbol IN (
-			SELECT DISTINCT symbol 
-			FROM stock_historical_data
-		)
+		SELECT DISTINCT symbol 
+		FROM stock_historical_data
 		ORDER BY symbol
 	`)
 	if err != nil {
