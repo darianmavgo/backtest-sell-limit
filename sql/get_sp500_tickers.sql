@@ -1,1 +1,1 @@
-SELECT symbol FROM {ticker_table}; 
+SELECT DISTINCT symbol FROM stock_historical_data ORDER BY symbol; 

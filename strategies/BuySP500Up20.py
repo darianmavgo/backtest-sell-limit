@@ -1,165 +1,185 @@
 import backtrader as bt
 import logging
+import sqlite3
+from datetime import datetime
 
 class BuySP500Up20(bt.Strategy):
-    """A strategy that buys stocks and sets sell limits at 20% above purchase price"""
-    
     def __init__(self):
-        self.orders = {}  # Keep track of buy orders
-        self.sell_orders = {}  # Keep track of sell limit orders
+        self.positions_entered = set()  # Set of symbol names
+        self.db_path = 'backtest_sell_limits.db'
+        self.trade_queue = []
         self.initial_cash = self.broker.getvalue()
-        self.stocks_bought = False
-        self.purchase_prices = {}  # Keep track of purchase prices
-        self.daily_values = []  # Track daily portfolio values
-        self.trade_queue = []  # Queue for deferred database writes
-        
-    def next(self):
-        # Track daily portfolio value
-        self.daily_values.append((self.datetime.date(), self.broker.getvalue()))
-        
-        # Buy stocks on the first day
-        if not self.stocks_bought:
-            for data in self.datas:
-                # Check if we have data
-                if len(data) > 0:
-                    # Buy 1 share of each stock using bracket order
-                    size = 1
-                    
-                    # Calculate target price (20% above current price)
-                    current_price = data.close[0]
-                    target_price = current_price * 1.20
-                    
-                    # Create market buy order first
-                    buy_order = self.buy(data=data, size=size)
-                    
-                    # Create sell limit order at target price
-                    sell_order = self.sell(data=data, 
-                                         size=size, 
-                                         exectype=bt.Order.Limit,
-                                         price=target_price,
-                                         parent=buy_order,
-                                         transmit=True)
-                    
-                    self.purchase_prices[data._name] = current_price
-                    logging.info(
-                        f"Placed bracket order for {data._name}", 
-                        extra={'symbol': data._name, 'price': current_price}
-                    )
-                else:
-                    logging.warning(f"No data available for {data._name}", extra={'symbol': data._name})
-            
-            self.stocks_bought = True
-    
+
+    def _write_to_db(self, data: dict):
+        """Write a single record to strategy_history table."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                strategy_name TEXT,
+                symbol TEXT,
+                event_type TEXT,
+                order_type TEXT,
+                status TEXT,
+                order_ref INTEGER,
+                parent_ref INTEGER,
+                price REAL,
+                size REAL,
+                trade_type TEXT,
+                trade_status TEXT,
+                quantity REAL,
+                value REAL,
+                pnl REAL,
+                pnl_percent REAL,
+                commission REAL,
+                trade_date TEXT
+            )
+        """)
+
+        c.execute("""
+            INSERT INTO strategy_history (
+                timestamp, strategy_name, symbol, event_type,
+                order_type, status, order_ref, parent_ref,
+                price, size, trade_type, trade_status,
+                quantity, value, pnl, pnl_percent, commission, trade_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.utcnow().isoformat(),
+            data.get('strategy_name'),
+            data.get('symbol'),
+            data.get('event_type'),
+            data.get('order_type'),
+            data.get('status'),
+            data.get('order_ref'),
+            data.get('parent_ref'),
+            data.get('price'),
+            data.get('size'),
+            data.get('trade_type'),
+            data.get('trade_status'),
+            data.get('quantity'),
+            data.get('value'),
+            data.get('pnl'),
+            data.get('pnl_percent'),
+            data.get('commission'),
+            data.get('trade_date')
+        ))
+
+        conn.commit()
+        conn.close()
+
     def notify_order(self, order):
-        """Log order notifications to the database."""
-        extra_data = {
+        """Log order notifications to DB."""
+        record = {
+            'strategy_name': self.__class__.__name__,
             'symbol': order.data._name,
+            'event_type': 'ORDER',
             'order_type': order.ordtypename(),
             'status': order.getstatusname(),
             'order_ref': order.ref,
-            'parent_ref': order.parent.ref if order.parent else None
+            'parent_ref': order.parent.ref if order.parent else None,
+            'price': None,
+            'size': None,
+            'trade_type': None,
+            'trade_status': None,
+            'quantity': None,
+            'value': None,
+            'pnl': None,
+            'pnl_percent': None,
+            'commission': None,
+            'trade_date': self.datetime.date().strftime('%Y-%m-%d')
         }
-        
-        message = f"Order Notification: {order.data._name} - {order.ordtypename()} - {order.getstatusname()}"
 
         if order.status == order.Completed:
-            extra_data['price'] = order.executed.price
-            extra_data['size'] = order.executed.size
-            message = f"Order Completed: {order.data._name} - {order.ordtypename()} at {order.executed.price}"
-            logging.info(message, extra=extra_data)
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            logging.warning(message, extra=extra_data)
-        else: # Submitted, Accepted, Partial
-            logging.info(message, extra=extra_data)
+            record['price'] = order.executed.price
+            record['size'] = order.executed.size
+        self._write_to_db(record)
+
+        # Optional logging
+        logging.info(f"Order: {record}")
 
     def notify_trade(self, trade):
-        """Queue trade notifications for database insertion."""
+        """Log trade notifications to DB."""
         if trade.isclosed:
-            # Calculate PnL percentage
             pnl_percent = (trade.pnl / abs(trade.price)) * 100 if trade.price != 0 else 0
-            
-            # Queue the trade for database insertion
-            self.trade_queue.append({
-                'strategy_name': "PortfolioStrategy_20_percent_sell_limit",
+            record = {
+                'strategy_name': self.__class__.__name__,
                 'symbol': trade.data._name,
-                'trade_type': "LONG" if trade.size > 0 else "SHORT",
-                'trade_status': "CLOSE",
-                'quantity': abs(trade.size),
+                'event_type': 'TRADE',
+                'order_type': None,
+                'status': 'CLOSE',
+                'order_ref': None,
+                'parent_ref': None,
                 'price': trade.price,
+                'size': abs(trade.size),
+                'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                'trade_status': 'CLOSED',
+                'quantity': abs(trade.size),
                 'value': abs(trade.value),
                 'pnl': trade.pnl,
                 'pnl_percent': pnl_percent,
                 'commission': trade.commission,
                 'trade_date': self.datetime.date().strftime('%Y-%m-%d')
-            })
-            
-            # Log trade details
-            logging.info(
-                f"Trade Closed: {trade.data._name} - PnL: ${trade.pnl:.2f} ({pnl_percent:.2f}%)",
-                extra={
-                    'symbol': trade.data._name,
-                    'trade_type': "LONG" if trade.size > 0 else "SHORT",
-                    'size': abs(trade.size),
-                    'price': trade.price,
-                    'value': abs(trade.value),
-                    'pnl': trade.pnl,
-                    'pnl_percent': pnl_percent,
-                    'commission': trade.commission
-                }
-            )
+            }
         elif trade.isopen:
-            # Queue the trade for database insertion
-            self.trade_queue.append({
-                'strategy_name': "PortfolioStrategy_20_percent_sell_limit",
+            record = {
+                'strategy_name': self.__class__.__name__,
                 'symbol': trade.data._name,
-                'trade_type': "LONG" if trade.size > 0 else "SHORT",
-                'trade_status': "OPEN",
-                'quantity': abs(trade.size),
+                'event_type': 'TRADE',
+                'order_type': None,
+                'status': 'OPEN',
+                'order_ref': None,
+                'parent_ref': None,
                 'price': trade.price,
+                'size': abs(trade.size),
+                'trade_type': "LONG" if trade.size > 0 else "SHORT",
+                'trade_status': 'OPEN',
+                'quantity': abs(trade.size),
                 'value': abs(trade.value),
-                'pnl': 0,  # not realized yet
-                'pnl_percent': 0,  # not realized yet
+                'pnl': 0,
+                'pnl_percent': 0,
                 'commission': trade.commission,
                 'trade_date': self.datetime.date().strftime('%Y-%m-%d')
-            })
-            
-            logging.info(
-                f"Trade Opened: {trade.data._name} - Size: {abs(trade.size)} @ ${trade.price:.2f}",
-                extra={
-                    'symbol': trade.data._name,
-                    'trade_type': "LONG" if trade.size > 0 else "SHORT",
-                    'size': abs(trade.size),
-                    'price': trade.price,
-                    'value': abs(trade.value),
-                    'commission': trade.commission
-                }
-            )
+            }
 
-    def stop(self):
-        # Calculate return
-        final_value = self.broker.getvalue()
-        total_return = (final_value - self.initial_cash) / self.initial_cash * 100
-        
-        # Import here to avoid circular imports
-        from portfolio_backtest import save_backtest_results, process_trade_queue
-        
-        # Process queued trades first
-        if self.trade_queue:
-            logging.info(f"Processing {len(self.trade_queue)} queued trades...")
-            process_trade_queue(self.trade_queue)
-        
-        # Save results
-        save_backtest_results(
-            self.__class__.__name__,
-            self.daily_values,
-            self.initial_cash,
-            final_value,
-            total_return
-        ) 
+        self._write_to_db(record)
+
+        # Optional logging
+        logging.info(f"Trade: {record}")
 
     def start(self):
-        logging.info(' Starting ', self.__class__.__name__ )
-        
+        logging.info(f"Starting {self.__class__.__name__}")
+
+    def stop(self):
+        final_value = self.broker.getvalue()
+        total_return = (final_value - self.initial_cash) / self.initial_cash * 100
+        logging.info(f"Final Portfolio Value: {final_value:.2f} | Total Return: {total_return:.2f}%")
+
+    def next(self):
         for d in self.datas:
-            # Place a market order to buy 1 share of each stock
-            self.buy(data=d, size=1)
+            symbol = d._name
+            if symbol in self.positions_entered:
+                continue  # Already entered this symbol — skip!
+
+            # Check if no position exists for this data
+            position = self.getposition(d)
+            if position.size == 0:
+                price = d.close[0]
+                take_profit = price * 1.2
+
+                self.buy_bracket(
+                    data=d,
+                    size=1,
+                    price=None,  # Market order
+                    stopprice=None,
+                    limitprice=take_profit,
+                    transmit=True
+                )
+
+                logging.info(
+                    f"Bracket order for {symbol}: Buy at market, TP at {take_profit:.2f}"
+                )
+
+                self.positions_entered.add(symbol)  # Mark this symbol as entered
