@@ -9,14 +9,16 @@ import os
 import atexit
 from database_log_handler import DatabaseLogHandler
 from db_manager import SQLiteConnectionManager
-from strategies import BracketStrategy, PortfolioStrategy
+from strategies import BuySP500Up20
 
 # Global settings
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_sell_limits.db")
 TICKER_TABLE = "ticker_list"
-START_DATE = "2024-05-01"
+START_DATE = "2024-06-01"
 END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0 # A large amount to ensure any trade can be made
+# self.__class__.__name__ gives you the class name as a string.
+
 
 # Global database connection
 db = SQLiteConnectionManager(DB_FILE)
@@ -179,23 +181,20 @@ def setup_logging():
     return logger
 
 def run_backtest():
-    """Run the portfolio backtest"""
-    strategy_name = "PortfolioStrategy_20_percent_sell_limit"
-    
+    strategy_name ="BuySP500Up20"
     # Clear old data before setting up logging
     clear_backtest_history(strategy_name)
 
     # Setup logging to the database
     logger = setup_logging()
 
-    logger.info(f"Starting backtest for strategy: {strategy_name}")
     logger.info(f"Date range: {START_DATE} to {END_DATE}")
 
     # Set up Backtrader
     cerebro = bt.Cerebro()
     
     # Add our strategy
-    cerebro.addstrategy(PortfolioStrategy)
+    cerebro.addstrategy(BuySP500Up20)
     
     # Get portfolio data
     portfolio_df = get_portfolio_data()

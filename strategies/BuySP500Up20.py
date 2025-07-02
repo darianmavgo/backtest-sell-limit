@@ -1,7 +1,7 @@
 import backtrader as bt
 import logging
 
-class PortfolioStrategy(bt.Strategy):
+class BuySP500Up20(bt.Strategy):
     """A strategy that buys stocks and sets sell limits at 20% above purchase price"""
     
     def __init__(self):
@@ -150,9 +150,16 @@ class PortfolioStrategy(bt.Strategy):
         
         # Save results
         save_backtest_results(
-            "PortfolioStrategy_20_percent_sell_limit",
+            self.__class__.__name__,
             self.daily_values,
             self.initial_cash,
             final_value,
             total_return
         ) 
+
+    def start(self):
+        logging.info(' Starting ', self.__class__.__name__ )
+        
+        for d in self.datas:
+            # Place a market order to buy 1 share of each stock
+            self.buy(data=d, size=1)
