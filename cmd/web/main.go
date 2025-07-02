@@ -442,6 +442,9 @@ func fetchHistoricalTickerData(ticker string, startDate, endDate time.Time) ([]t
 
 
 func init() {
+	// Initialize configuration
+	InitConfig()
+
 	// Initialize database
 	var err error
 	BacktestDB, err = initDB()

@@ -22,79 +22,7 @@ import (
 
 // homeHandler renders the README.md file as HTML
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	// Read the README.md file
-	readmeContent, err := os.ReadFile("README.md")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to read README.md: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Convert markdown to HTML
-	htmlContent := convertMarkdownToHTML(string(readmeContent))
-
-	// Create a basic HTML page with styling
-	fullHTML := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Backtest Sell Limits</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #fafafa;
-        }
-        .container {
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
-        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; }
-        h3 { color: #7f8c8d; margin-top: 25px; }
-        h4 { color: #95a5a6; margin-top: 20px; }
-        code {
-            background: #f8f9fa;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 14px;
-        }
-        pre {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            overflow-x: auto;
-            border-left: 4px solid #3498db;
-        }
-        pre code {
-            background: none;
-            padding: 0;
-        }
-        ul { padding-left: 20px; }
-        li { margin: 8px 0; }
-        a { color: #3498db; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        %s
-    </div>
-</body>
-</html>`, htmlContent)
-
-	// Set content type to HTML
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fullHTML))
+	readmeHandler(w, r)
 }
 
 // readmeHandler serves the raw README markdown with route links
@@ -373,32 +301,44 @@ func stockHandler(w http.ResponseWriter, r *http.Request) {
 
 // fillHistoricalDataHandler fills historical data for all stocks
 func fillHistoricalDataHandler(w http.ResponseWriter, r *http.Request) {
-	// Get list of active tickers
-	tickers, err := getActiveSP500Tickers(BacktestDB)
+	// Get list of S&P 500 stocks
+	stocks, err := fetchSP500List()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get tickers: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to get S&P 500 list: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("Starting historical data download for %d S&P 500 stocks", len(stocks))
+
 	// Process each ticker
-	for _, symbol := range tickers {
+	completed := 0
+	for _, stock := range stocks {
+		log.Printf("Processing %s (%d/%d)", stock.Symbol, completed+1, len(stocks))
+		
 		// Get historical data
-		data, err := fetchHistoricalData(symbol)
+		data, err := fetchHistoricalData(stock.Symbol)
 		if err != nil {
-			log.Printf("Failed to fetch historical data for %s: %v", symbol, err)
+			log.Printf("Failed to fetch historical data for %s: %v", stock.Symbol, err)
 			continue
 		}
 
 		// Save to database
-		if err := saveHistoricalData(BacktestDB, symbol, data); err != nil {
-			log.Printf("Failed to save historical data for %s: %v", symbol, err)
+		if err := saveHistoricalData(BacktestDB, stock.Symbol, data); err != nil {
+			log.Printf("Failed to save historical data for %s: %v", stock.Symbol, err)
 			continue
 		}
+		
+		completed++
+		log.Printf("Completed %s (%d/%d)", stock.Symbol, completed, len(stocks))
 	}
 
+	log.Printf("Historical data download completed. Processed %d out of %d stocks", completed, len(stocks))
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "completed",
+		"processed": completed,
+		"total": len(stocks),
 	})
 }
 
@@ -555,13 +495,13 @@ func setupRoutes() *chi.Mux {
 		r.Get("/stock/{symbol}", stockHandler)
 		r.Get("/stock/historical/{symbol}", historicalDataHandler)
 		r.Get("/stock/historical/fill", fillHistoricalDataHandler)
-		
+
 		// Portfolio routes
 		r.Get("/portfolio/backtest", portfolioBacktestHandler)
-		
+
 		// S&P 500 routes
 		r.Get("/sp500", listSP500Handler)
-		
+
 		// Database browsing routes
 		r.Get("/tables", tablesHandler)
 		r.Get("/tables/{table}", tableDataHandler)
@@ -676,9 +616,32 @@ func fetchSP500List() ([]types.SP500Stock, error) {
 
 // fetchHistoricalData fetches historical data for a given symbol
 func fetchHistoricalData(symbol string) ([]types.StockData, error) {
-	// Implement the actual data fetching logic here
-	// For now, return empty data
-	return []types.StockData{}, nil
+	// Set date range (last 2 years)
+	endDate := time.Now()
+	startDate := endDate.AddDate(-2, 0, 0)
+	
+	// Fetch data using the existing function
+	data, err := fetchHistoricalTickerData(symbol, startDate, endDate)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Convert to StockData format
+	var stockData []types.StockData
+	for _, d := range data {
+		stockData = append(stockData, types.StockData{
+			Symbol:   d.Symbol,
+			Date:     d.Date,
+			Open:     d.Open,
+			High:     d.High,
+			Low:      d.Low,
+			Close:    d.Close,
+			AdjClose: d.AdjClose,
+			Volume:   d.Volume,
+		})
+	}
+	
+	return stockData, nil
 }
 
 // saveHistoricalData saves historical stock data to the database
