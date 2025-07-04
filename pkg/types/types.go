@@ -12,6 +12,7 @@ type Config struct {
 	ENV                string // DEV, Prod, Local, Hosted
 	TopLevelDir        string // Top level directory of the application.
 	BacktestDB         string // Application Support App settings like store of credentials, known connections.
+	SPXLBacktestDB     string // New field for SPXL specific database
 	ServiceAccountJson string // Need to move ServiceAccountJson to credential struct.
 	Port               string // Config.Port is the port that Mavgo Flight service binds to.  Do not confuse with port of a request.
 	TopCacheDir        string // Remote files and local files cached as sqlite land in this folder

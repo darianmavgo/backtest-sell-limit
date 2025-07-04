@@ -1,0 +1,1 @@
+INSERT OR IGNORE INTO spxl_tickers (symbol) VALUES ('SPXL');

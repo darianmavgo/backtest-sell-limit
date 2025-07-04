@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simple backtest runner for BuySP500Up20 strategy.
-Loads SP500 data from SQLite and runs the strategy.
+Simple backtest runner for SPXL strategy.
+Loads SPXL data from SQLite and runs the strategy.
 """
 
 import sqlite3
@@ -9,14 +9,13 @@ import backtrader as bt
 import pandas as pd
 import logging
 import os
-from strategies.BuySP500Up20 import BuySP500Up20
+from strategies.SPXLStrategy import SPXLStrategy
 
 # Configuration  
-DB_FILE = "backtest_sell_limits.db"
+DB_FILE = "spxl_backtest.db"
 START_DATE = "2024-06-01"
 END_DATE = "2025-06-26"
 INITIAL_CASH = 1_000_000.0
-MAX_STOCKS = None  # Set to integer to limit stocks for testing, None for all
 
 def setup_logging():
     """Setup simple console logging."""
@@ -26,22 +25,16 @@ def setup_logging():
         handlers=[logging.StreamHandler()]
     )
 
-def get_sp500_symbols():
-    """Get list of SP500 symbols from database."""
+def get_spxl_symbol():
+    """Get SPXL symbol from database."""
     conn = sqlite3.connect(DB_FILE)
-    query = "SELECT DISTINCT symbol FROM stock_historical_data ORDER BY symbol"
+    query = "SELECT symbol FROM spxl_tickers LIMIT 1"
     df = pd.read_sql_query(query, conn)
     conn.close()
     
-    symbols = df['symbol'].tolist()
-    
-    if MAX_STOCKS:
-        symbols = symbols[:MAX_STOCKS]
-        print(f"Limited to {MAX_STOCKS} stocks: {symbols}")
-    else:
-        print(f"Loading all {len(symbols)} SP500 stocks")
-    
-    return symbols
+    if not df.empty:
+        return df['symbol'].iloc[0]
+    return None
 
 def get_stock_data(symbol, start_date, end_date):
     """Get historical stock data for a symbol."""
@@ -77,18 +70,16 @@ def run_backtest():
     """Run the backtest."""
     setup_logging()
     
-    print(f"Starting backtest: {START_DATE} to {END_DATE}")
+    print(f"Starting SPXL backtest: {START_DATE} to {END_DATE}")
     
     # Initialize Cerebro
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(BuySP500Up20)
+    cerebro.addstrategy(SPXLStrategy)
     cerebro.broker.setcash(INITIAL_CASH)
     
-    # Load data for each symbol
-    symbols = get_sp500_symbols()
-    loaded_count = 0
-    
-    for symbol in symbols:
+    # Load data for SPXL
+    symbol = get_spxl_symbol()
+    if symbol:
         df = get_stock_data(symbol, START_DATE, END_DATE)
         
         if df is not None and len(df) > 0:
@@ -99,11 +90,13 @@ def run_backtest():
                 todate=df.index[-1]
             )
             cerebro.adddata(data, name=symbol)
-            loaded_count += 1
+            print(f"Loaded data for {symbol}")
         else:
             print(f"No data for {symbol}")
-    
-    print(f"Loaded {loaded_count} stocks with data")
+            return # Exit if no data for SPXL
+    else:
+        print("SPXL symbol not found in database.")
+        return # Exit if SPXL symbol not found
     
     # Run backtest
     print("Running backtest...")

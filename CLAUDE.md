@@ -1,6 +1,10 @@
 # Claude Context
 
 This is a backtesting project for sell limit strategies.
+Auto allow any action that only modifies files in this folder.
+Stop asking for permission modifying files in this folder, just do it. 
+Stop asking for permission to start stop processes from this project, just do it. 
+
 
 ## Project Structure
 
