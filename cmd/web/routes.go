@@ -114,7 +114,7 @@ func sp500Handler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if err := saveHistoricalData(BacktestDB, stock.Symbol, data); err != nil {
+		if err := saveStockHistoricalData(BacktestDB, stock.Symbol, data); err != nil {
 			log.Printf("Failed to save historical data for %s: %v", stock.Symbol, err)
 			continue
 		}
@@ -334,7 +334,7 @@ func fillHistoricalDataHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Save to database
-		if err := saveHistoricalData(BacktestDB, stock.Symbol, data); err != nil {
+		if err := saveStockHistoricalData(BacktestDB, stock.Symbol, data); err != nil {
 			log.Printf("Failed to save historical data for %s: %v", stock.Symbol, err)
 			continue
 		}
@@ -400,7 +400,7 @@ func fillHistoricalDataForSymbolHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Save to database
-	if err := saveHistoricalData(BacktestDB, symbol, data); err != nil {
+	if err := saveStockHistoricalData(BacktestDB, symbol, data); err != nil {
 		log.Printf("Failed to save historical data for %s: %v", symbol, err)
 		http.Error(w, fmt.Sprintf("Failed to save historical data for %s: %v", symbol, err), http.StatusInternalServerError)
 		return
@@ -549,7 +549,10 @@ func setupRoutes() *chi.Mux {
 		r.Get("/sp500", listSP500Handler)
 
 		// SPXL routes
-		r.Get("/spxl/historical/fill", fillSPXLHistoricalDataHandler)
+		r.Get("/spxl/historical/fill", FillHistoricalDataHandler)
+
+		// Insurance tickers routes
+		r.Get("/insurance/historical/fill", FillHistoricalDataHandler)
 
 		// Database browsing routes
 		r.Get("/tables", tablesHandler)
@@ -693,8 +696,8 @@ func fetchHistoricalData(symbol string) ([]types.StockData, error) {
 	return stockData, nil
 }
 
-// saveHistoricalData saves historical stock data to the database
-func saveHistoricalData(db *sql.DB, symbol string, data []types.StockData) error {
+// saveStockHistoricalData saves historical stock data to the database
+func saveStockHistoricalData(db *sql.DB, symbol string, data []types.StockData) error {
 	// Begin transaction
 	tx, err := BacktestDB.Begin()
 	if err != nil {
@@ -750,187 +753,6 @@ func getActiveSP500Tickers(db *sql.DB) ([]string, error) {
 	rows, err := BacktestDB.Query(`
 		SELECT symbol 
 		FROM ticker_list 
-		ORDER BY symbol
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tickers: %v", err)
-	}
-	defer rows.Close()
-
-	var tickers []string
-	for rows.Next() {
-		var symbol string
-		if err := rows.Scan(&symbol); err != nil {
-			return nil, fmt.Errorf("failed to scan ticker: %v", err)
-		}
-		tickers = append(tickers, symbol)
-	}
-
-	return tickers, nil
-}
-
-// fetchSP500List fetches the current S&P 500 constituents from local HTML file
-func fetchSP500List() ([]types.SP500Stock, error) {
-	// Read the local HTML file
-	content, err := os.ReadFile("sp500.html")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read sp500.html: %v", err)
-	}
-
-	// Parse the HTML document
-	doc, err := nethtml.Parse(bytes.NewReader(content))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse HTML: %v", err)
-	}
-
-	var stocks []types.SP500Stock
-	var f func(*nethtml.Node)
-	f = func(n *nethtml.Node) {
-		if n.Type == nethtml.ElementNode && n.Data == "table" {
-			// Check if this is the S&P 500 table
-			for _, a := range n.Attr {
-				if a.Key == "id" && a.Val == "constituents" {
-					// Found the right table, now parse rows
-					var currentStock types.SP500Stock
-					var inRow bool
-					var colIndex int
-
-					var parseRow func(*nethtml.Node)
-					parseRow = func(n *nethtml.Node) {
-						if n.Type == nethtml.ElementNode {
-							switch n.Data {
-							case "tr":
-								if n.Parent != nil && n.Parent.Data == "tbody" {
-									inRow = true
-									colIndex = 0
-									currentStock = types.SP500Stock{}
-								}
-							case "td":
-								if !inRow {
-									return
-								}
-								switch colIndex {
-								case 0: // Symbol column
-									// Find the first anchor tag
-									for c := n.FirstChild; c != nil; c = c.NextSibling {
-										if c.Type == nethtml.ElementNode && c.Data == "a" {
-											if c.FirstChild != nil {
-												currentStock.Symbol = strings.TrimSpace(c.FirstChild.Data)
-											}
-											break
-										}
-									}
-								case 1: // Security Name column
-									// Find the first anchor tag
-									for c := n.FirstChild; c != nil; c = c.NextSibling {
-										if c.Type == nethtml.ElementNode && c.Data == "a" {
-											if c.FirstChild != nil {
-												currentStock.SecurityName = strings.TrimSpace(c.FirstChild.Data)
-											}
-											break
-										}
-									}
-									// After getting both columns, add to stocks if valid
-									if currentStock.Symbol != "" && currentStock.SecurityName != "" {
-										stocks = append(stocks, currentStock)
-									}
-								}
-								colIndex++
-							}
-						}
-						for c := n.FirstChild; c != nil; c = c.NextSibling {
-							parseRow(c)
-						}
-					}
-
-					// Parse all rows in the table
-					for c := n.FirstChild; c != nil; c = c.NextSibling {
-						parseRow(c)
-					}
-					return
-				}
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
-	}
-	f(doc)
-
-	if len(stocks) == 0 {
-		return nil, fmt.Errorf("no stocks found in HTML file")
-	}
-
-	return stocks, nil
-}
-
-// convertMarkdownToHTML converts markdown content to HTML
-func convertMarkdownToHTML(content string) string {
-	return string(markdown.ToHTML([]byte(content), nil, nil))
-}
-
-
-// saveHistoricalData saves historical stock data to the database
-func saveHistoricalData(db *sql.DB, symbol string, data []types.StockData) error {
-	// Begin transaction
-	tx, err := BacktestDB.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	defer tx.Rollback()
-
-	// Prepare statement
-	stmt, err := tx.Prepare(`
-		INSERT INTO stock_historical_data (
-			symbol, date, open, high, low, close, adj_close, volume
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(symbol, date) DO UPDATE SET
-			open = excluded.open,
-			high = excluded.high,
-			low = excluded.low,
-			close = excluded.close,
-			adj_close = excluded.adj_close,
-			volume = excluded.volume
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to prepare statement: %v", err)
-	}
-	defer stmt.Close()
-
-	// Insert data
-	for _, d := range data {
-		_, err = stmt.Exec(
-			symbol,
-			d.Date.Unix(),
-			d.Open,
-			d.High,
-			d.Low,
-			d.Close,
-			d.AdjClose,
-			d.Volume,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to insert historical data: %v", err)
-		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
-	}
-
-	return nil
-}
-
-// getActiveSP500Tickers returns a list of active S&P 500 tickers from the database
-func getActiveSP500Tickers(db *sql.DB) ([]string, error) {
-	rows, err := BacktestDB.Query(`
-		SELECT symbol 
-		FROM stock_data 
-		WHERE symbol IN (
-			SELECT DISTINCT symbol 
-			FROM stock_historical_data
-		)
 		ORDER BY symbol
 	`)
 	if err != nil {
